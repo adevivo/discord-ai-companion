@@ -92,3 +92,22 @@ def test_main_reports_rejected_token(monkeypatch, caplog):
     assert main() == 1
     assert "DISCORD_TOKEN" in caplog.text
     assert "discord-secret" not in caplog.text
+
+
+@pytest.mark.parametrize("name", ["DISCORD_TOKEN", "LLM_API_KEY"])
+def test_blank_secrets_are_rejected(monkeypatch, name):
+    _set_env(monkeypatch, **{name: ""})
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
+
+
+@pytest.mark.parametrize("name", ["DISCORD_GUILD_ID", "LLM_MAX_TOKENS"])
+def test_blank_optional_ints_mean_unset(monkeypatch, name):
+    _set_env(monkeypatch, **{name: ""})
+    assert getattr(Settings(_env_file=None), name.lower()) is None
+
+
+def test_optional_ints_parse(monkeypatch):
+    _set_env(monkeypatch, DISCORD_GUILD_ID="123", LLM_MAX_TOKENS="800")
+    s = Settings(_env_file=None)
+    assert (s.discord_guild_id, s.llm_max_tokens) == (123, 800)

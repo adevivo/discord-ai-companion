@@ -6,7 +6,7 @@ Secrets are typed as SecretStr so they are masked in repr/str/logs. Use
 
 from pathlib import Path
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 DEFAULT_SYSTEM_PROMPT = (
@@ -19,21 +19,35 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     # Discord
-    discord_token: SecretStr
+    discord_token: SecretStr = Field(min_length=1)
     # If set, slash commands sync to this server instantly instead of globally.
     discord_guild_id: int | None = None
 
     # LLM (any OpenAI-compatible endpoint)
     llm_base_url: str = "https://openrouter.ai/api/v1"
-    llm_api_key: SecretStr
+    llm_api_key: SecretStr = Field(min_length=1)
     llm_model: str = Field(min_length=1)
     llm_timeout_seconds: float = Field(default=60.0, gt=0)
     llm_max_retries: int = Field(default=1, ge=0)
+    # Cap on reply length in tokens; unset lets the provider decide.
+    llm_max_tokens: int | None = Field(default=None, gt=0)
 
     # Behaviour
     system_prompt: str = DEFAULT_SYSTEM_PROMPT
     context_messages: int = Field(default=20, ge=0)
+    # Upper bound on history sent to the LLM, so context can't outgrow the model.
+    context_max_chars: int = Field(default=24_000, ge=0)
     rate_limit_per_minute: int = Field(default=5, ge=1)
+    # Across all users: protects the provider account's quota.
+    global_rate_limit_per_minute: int = Field(default=20, ge=1)
 
     # Storage
     database_path: Path = Path("data/companion.db")
+
+    @field_validator("discord_guild_id", "llm_max_tokens", mode="before")
+    @classmethod
+    def _blank_is_unset(cls, value: object) -> object:
+        # `DISCORD_GUILD_ID=` in .env means "not set", not "invalid integer".
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value

@@ -11,6 +11,8 @@ services:
     read_only: true
     tmpfs:
       - /tmp
+    mem_limit: 256m
+    pids_limit: 100
     cap_drop:
       - ALL
     security_opt:

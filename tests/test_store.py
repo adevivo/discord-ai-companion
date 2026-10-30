@@ -62,3 +62,12 @@ async def test_persists_across_reopen(tmp_path):
     s = await ContextStore.open(path)
     assert [m.content for m in await s.recent("chan", 10)] == ["q", "a"]
     await s.close()
+
+
+async def test_clear_removes_only_that_scope(store):
+    await store.add_exchange("chan", "q", "a", retain=10)
+    await store.add_exchange("other", "q", "a", retain=10)
+    assert await store.clear("chan") == 2
+    assert await store.recent("chan", 10) == []
+    assert len(await store.recent("other", 10)) == 2
+    assert await store.clear("chan") == 0

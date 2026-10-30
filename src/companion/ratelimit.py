@@ -1,4 +1,4 @@
-"""In-memory sliding-window rate limiter, keyed per user."""
+"""In-memory sliding-window rate limiter, keyed (e.g. per user, or one global key)."""
 
 import time
 from collections import defaultdict, deque
@@ -19,13 +19,22 @@ class RateLimiter:
         self._clock = clock
         self._hits: dict[str, deque[float]] = defaultdict(deque)
 
-    def try_acquire(self, key: str) -> float:
-        """Record a request if allowed and return 0; otherwise return seconds until allowed."""
+    def retry_after(self, key: str) -> float:
+        """Seconds until `key` may make a request (0 if allowed now). Records nothing."""
         now = self._clock()
         hits = self._hits[key]
         while hits and now - hits[0] >= self._window:
             hits.popleft()
         if len(hits) >= self._max:
             return self._window - (now - hits[0])
-        hits.append(now)
         return 0.0
+
+    def record(self, key: str) -> None:
+        self._hits[key].append(self._clock())
+
+    def try_acquire(self, key: str) -> float:
+        """Record a request if allowed and return 0; otherwise return seconds until allowed."""
+        wait = self.retry_after(key)
+        if wait == 0:
+            self.record(key)
+        return wait

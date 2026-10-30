@@ -80,6 +80,8 @@ A private bot needs no approval or review. A "bot" is just an *application* you 
 
 Discord verification only applies once a bot reaches **100 servers**.
 
+**Slash-command sync:** with `DISCORD_GUILD_ID` set, commands appear in that server instantly. Commands synced *globally* by an earlier run without it stay registered, so if `/ask` shows up twice, that's the cause. If sync fails (wrong server ID, or the bot was invited without the `applications.commands` scope), the bot logs the error and keeps running; @mentions still work.
+
 ### 2. Configure
 
 ```sh
@@ -95,9 +97,12 @@ cp .env.example .env
 | `LLM_BASE_URL` | | `https://openrouter.ai/api/v1` | Any OpenAI-compatible endpoint |
 | `LLM_TIMEOUT_SECONDS` | | `60` | Per-request timeout |
 | `LLM_MAX_RETRIES` | | `1` | Retries on transient errors |
+| `LLM_MAX_TOKENS` | | provider default | Cap on reply length. Replies cut off at the cap are marked *(reply truncated)*. |
 | `SYSTEM_PROMPT` | | friendly assistant | Bot persona and instructions |
-| `CONTEXT_MESSAGES` | | `20` | Recent messages included as context |
+| `CONTEXT_MESSAGES` | | `20` | Recent messages kept and sent as context |
+| `CONTEXT_MAX_CHARS` | | `24000` | Character budget for context, so history can't outgrow the model's context window |
 | `RATE_LIMIT_PER_MINUTE` | | `5` | Per-user request limit |
+| `GLOBAL_RATE_LIMIT_PER_MINUTE` | | `20` | Limit across all users, to protect the provider account's quota |
 | `DATABASE_PATH` | | `data/companion.db` (`/data/companion.db` in Docker) | SQLite file location |
 
 Secrets are typed as `SecretStr`, so they're masked in logs and error output. If required values are missing, startup fails fast and names the missing variables, never their values.
@@ -115,6 +120,7 @@ Container hardening:
 - **Non-root user:** the bot runs as uid 10001.
 - **Read-only filesystem:** the only writable paths are `/data` (a named volume holding SQLite) and `/tmp`.
 - **Locked down:** all Linux capabilities are dropped and `no-new-privileges` is set.
+- **Resource caps:** memory is limited to 256 MB and processes to 100.
 - **No published ports:** all traffic is outbound.
 - **Secrets stay out of the image:** they're injected at runtime from `.env` and excluded from the build context.
 
@@ -162,13 +168,16 @@ tests/           # mirrors src; LLM and Discord are faked
 **Scope**
 - **Triggers:**
   - `@mention` replies in the same channel or thread.
+  - Replying to one of the bot's messages counts as a mention, as long as the reply ping is left on.
   - `/ask <prompt>` defers the interaction (Discord requires an acknowledgment within 3 seconds), then posts the answer as a follow-up.
-- **Context:** a rolling window of **bot-directed messages only**, per channel or thread: prompts sent to the bot and its replies. Other channel chatter is never read, so the privileged Message Content intent isn't needed. Each prompt is stored with the speaker's display name so the bot can tell people apart. Context lives in SQLite and survives restarts. An exchange is only stored if the LLM answered.
-- **Server-only:** DMs are ignored and `/ask` is guild-only. This stops people outside the server from using up the API quota.
+  - `/reset` clears the bot's memory of the current channel or thread. By default it needs Manage Messages; server admins can change that under Server Settings → Integrations.
+  - Not triggers: replies with the ping turned off, @mentions of the bot's *role*, system messages, webhooks, and other bots.
+- **Context:** a rolling window of **bot-directed messages only**, per channel or thread: prompts sent to the bot and its replies. Other channel chatter is never read, so the privileged Message Content intent isn't needed. Each prompt is stored with the speaker's display name so the bot can tell people apart, and its formatting (newlines, code) is preserved. History is capped by message count and a character budget, and always starts on a user turn. Requests in the same channel are handled one at a time, so each sees the previous exchange. Context lives in SQLite and survives restarts. An exchange is only stored if the LLM answered.
+- **Server-only:** DMs are ignored and slash commands are guild-only. This stops people outside the server from using up the API quota.
 - **Mention safety:** all bot messages are sent with mentions disabled, so LLM output can never ping `@everyone`, roles, or users.
 - **Output:** replies over 2000 characters are split at paragraph, line, or word boundaries. Code blocks are closed and reopened across chunks. No streaming, because repeatedly editing a message hits Discord rate limits.
-- **Limits and errors:** per-user rate limiting, and clear messages when the LLM is rate-limited, unavailable, or times out.
-- **Structured output:** JSON responses from the LLM are a first-class, tested component (parse, validate, retry), which Phase 2 depends on. We don't rely on native tool calling, since support is inconsistent across models.
+- **Limits:** per-user and global rate limits. A rate-limited user is told once per window, and further messages in that window are silently ignored, so spam doesn't turn into bot spam.
+- **Errors:** friendly messages when the LLM is rate-limited, unavailable, times out, or returns something malformed (e.g. a wrong `LLM_BASE_URL`). The provider's error text is logged to help diagnosis. If the user deleted their message while waiting, the answer is still posted.
 
 ## Phase 2: Game Master Mode
 
@@ -192,6 +201,9 @@ Long AI roleplay usually degrades for four reasons: the transcript is the only m
 | Drift goes uncorrected | **Player tools:** `/recap`, `/canon`, and a way to flag contradictions. |
 
 This greatly reduces drift but cannot eliminate it. Model choice matters, especially for following the facts given in the prompt and for producing reliable JSON.
+
+### Structured output (prerequisite)
+Game state updates come back from the LLM as JSON, so parsing, validating, and retrying JSON responses will be a first-class, tested component. We won't rely on native tool calling, since support is inconsistent across models.
 
 ### Light mechanics
 - Code rolls dice only when an outcome is uncertain. Results are **success / partial success / failure**.

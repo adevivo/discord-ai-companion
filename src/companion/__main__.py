@@ -21,24 +21,35 @@ log = logging.getLogger("companion")
 
 async def run(settings: Settings) -> None:
     store = await ContextStore.open(settings.database_path)
+    llm = LLMClient(settings)
     try:
         chat = ChatService(
-            llm=LLMClient(settings),
+            llm=llm,
             store=store,
-            limiter=RateLimiter(settings.rate_limit_per_minute),
+            user_limiter=RateLimiter(settings.rate_limit_per_minute),
+            global_limiter=RateLimiter(settings.global_rate_limit_per_minute),
             system_prompt=settings.system_prompt,
             context_messages=settings.context_messages,
+            context_max_chars=settings.context_max_chars,
         )
         bot = CompanionBot(chat, guild_id=settings.discord_guild_id)
 
         # `docker stop` sends SIGTERM; close the gateway connection cleanly.
+        # Keep a reference to the task so it can't be garbage-collected mid-flight.
+        shutdown_tasks: set[asyncio.Task] = set()
+
+        def request_shutdown() -> None:
+            log.info("SIGTERM received; shutting down")
+            shutdown_tasks.add(asyncio.create_task(bot.close()))
+
         loop = asyncio.get_running_loop()
         with contextlib.suppress(NotImplementedError):
-            loop.add_signal_handler(signal.SIGTERM, lambda: asyncio.ensure_future(bot.close()))
+            loop.add_signal_handler(signal.SIGTERM, request_shutdown)
 
         async with bot:
             await bot.start(settings.discord_token.get_secret_value())
     finally:
+        await llm.aclose()
         await store.close()
 
 

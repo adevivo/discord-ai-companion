@@ -11,6 +11,7 @@ import openai
 import pytest
 
 from companion.llm import (
+    TRUNCATION_NOTE,
     ChatMessage,
     LLMClient,
     LLMError,
@@ -21,14 +22,14 @@ from companion.llm import (
 MESSAGES = [ChatMessage("system", "be nice"), ChatMessage("user", "hello")]
 
 
-def _completion(content: str | None) -> dict:
+def _completion(content: str | None, finish_reason: str = "stop") -> dict:
     choices = (
         []
         if content is None
         else [
             {
                 "index": 0,
-                "finish_reason": "stop",
+                "finish_reason": finish_reason,
                 "message": {"role": "assistant", "content": content},
             }
         ]
@@ -120,3 +121,69 @@ async def test_api_key_not_in_error_messages(settings):
 async def test_rejects_empty_message_list(settings):
     with pytest.raises(ValueError):
         await _client(settings, lambda r: httpx.Response(200)).complete([])
+
+
+async def test_max_tokens_omitted_by_default(settings):
+    seen = {}
+
+    def handler(request):
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json=_completion("hi"))
+
+    await _client(settings, handler).complete(MESSAGES)
+    assert "max_tokens" not in seen["body"]
+
+
+async def test_max_tokens_sent_when_configured(settings):
+    settings = settings.model_copy(update={"llm_max_tokens": 500})
+    seen = {}
+
+    def handler(request):
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json=_completion("hi"))
+
+    await _client(settings, handler).complete(MESSAGES)
+    assert seen["body"]["max_tokens"] == 500
+
+
+async def test_provider_error_text_is_included_for_logs(settings):
+    body = {"error": {"message": "maximum context length is 8192 tokens"}}
+    client = _client(settings, lambda r: httpx.Response(400, json=body))
+    with pytest.raises(LLMError, match="maximum context length"):
+        await client.complete(MESSAGES)
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(200, text="<html>Not the API</html>", headers={"content-type": "text/html"}),
+        httpx.Response(200, text="{not json", headers={"content-type": "application/json"}),
+        httpx.Response(200, json=[1, 2, 3]),
+        httpx.Response(
+            200,
+            json={
+                "id": "x",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "m",
+                "choices": [{"index": 0, "finish_reason": "error", "message": None}],
+            },
+        ),
+    ],
+    ids=["html", "bad-json", "list", "null-message"],
+)
+async def test_malformed_responses_become_llm_errors(settings, response):
+    client = _client(settings, lambda r: response)
+    with pytest.raises(LLMError):
+        await client.complete(MESSAGES)
+
+
+async def test_truncated_reply_is_marked(settings):
+    client = _client(settings, lambda r: httpx.Response(200, json=_completion("partial", "length")))
+    assert await client.complete(MESSAGES) == "partial" + TRUNCATION_NOTE
+
+
+async def test_aclose_closes_sdk_client(settings):
+    client = _client(settings, lambda r: httpx.Response(200, json=_completion("hi")))
+    await client.aclose()
+    assert client._client.is_closed()

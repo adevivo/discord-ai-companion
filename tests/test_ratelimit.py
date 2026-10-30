@@ -58,3 +58,11 @@ def test_users_are_independent():
 def test_rejects_invalid_max():
     with pytest.raises(ValueError):
         RateLimiter(0)
+
+
+def test_retry_after_does_not_record():
+    limiter = RateLimiter(1, clock=FakeClock())
+    for _ in range(3):
+        assert limiter.retry_after("u") == 0
+    limiter.record("u")
+    assert limiter.retry_after("u") > 0

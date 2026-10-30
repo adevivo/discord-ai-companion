@@ -55,6 +55,12 @@ class ContextStore:
         )
         await self._db.commit()
 
+    async def clear(self, scope_id: str) -> int:
+        """Delete all context for a scope; returns the number of messages removed."""
+        cursor = await self._db.execute("DELETE FROM messages WHERE scope_id = ?", (scope_id,))
+        await self._db.commit()
+        return cursor.rowcount
+
     async def recent(self, scope_id: str, limit: int) -> list[ChatMessage]:
         """Return up to `limit` most recent messages for a scope, oldest first."""
         if limit <= 0:

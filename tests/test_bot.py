@@ -2,17 +2,19 @@
 
 import contextlib
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import discord
 import pytest
 
 from companion.bot import (
     GENERIC_ERROR_REPLY,
+    RESET_REPLY,
     CompanionBot,
     format_ask_reply,
     handle_ask,
     handle_mention,
+    handle_reset,
     prepare_prompt,
 )
 
@@ -24,26 +26,47 @@ def blocks_all_mentions(allowed: discord.AllowedMentions) -> bool:
     return allowed.to_dict() == NO_MENTIONS
 
 
+def http_error() -> discord.HTTPException:
+    return discord.HTTPException(MagicMock(status=500, reason="err"), "boom")
+
+
 class FakeChat:
     def __init__(self, reply="pong", error=None):
         self.reply = reply
         self.error = error
         self.calls = []
+        self.kwargs = []
+        self.reset_scopes = []
 
-    async def respond(self, scope_id, user_id, author_name, text):
+    async def respond(self, scope_id, user_id, author_name, text, **kwargs):
         self.calls.append((scope_id, user_id, author_name, text))
+        self.kwargs.append(kwargs)
         if self.error:
             raise self.error
         return self.reply
+
+    async def reset(self, scope_id):
+        self.reset_scopes.append(scope_id)
+        return 4
 
 
 def user(user_id, name="Sam", bot=False):
     return SimpleNamespace(id=user_id, display_name=name, bot=bot)
 
 
-def make_message(content, mentions, author=None, guild=True):
+def make_message(
+    content,
+    mentions,
+    author=None,
+    guild=True,
+    type=discord.MessageType.default,
+    webhook_id=None,
+    typing_error=None,
+):
     @contextlib.asynccontextmanager
     async def typing():
+        if typing_error:
+            raise typing_error
         yield
 
     channel = SimpleNamespace(id=42, typing=typing, send=AsyncMock())
@@ -52,8 +75,19 @@ def make_message(content, mentions, author=None, guild=True):
         mentions=mentions,
         author=author or user(1),
         guild=SimpleNamespace(id=7) if guild else None,
+        type=type,
+        webhook_id=webhook_id,
         channel=channel,
-        reply=AsyncMock(),
+        to_reference=MagicMock(return_value="REF"),
+    )
+
+
+def make_interaction():
+    return SimpleNamespace(
+        channel_id=42,
+        user=user(1),
+        response=SimpleNamespace(defer=AsyncMock(), send_message=AsyncMock()),
+        followup=SimpleNamespace(send=AsyncMock()),
     )
 
 
@@ -70,6 +104,11 @@ def test_prepare_prompt_names_other_users():
     assert prepare_prompt(text, BOT_ID, {5: "Ann"}) == "say hi to @Ann and <@6>"
 
 
+def test_prepare_prompt_preserves_newlines_and_indentation():
+    text = f"<@{BOT_ID}> fix this:\n```py\ndef f():\n    return 1\n```"
+    assert prepare_prompt(text, BOT_ID, {}) == "fix this:\n```py\ndef f():\n    return 1\n```"
+
+
 def test_format_ask_reply_quotes_question():
     assert format_ask_reply("what is\nlife?", "42") == "> what is life?\n\n42"
 
@@ -83,31 +122,43 @@ def test_format_ask_reply_truncates_long_question():
 # --- handle_mention ----------------------------------------------------------
 
 
-async def test_mention_is_answered_with_reply():
+async def test_mention_is_answered_as_reply():
     chat = FakeChat("pong")
     msg = make_message(f"<@{BOT_ID}> ping", [user(BOT_ID, "Bot", bot=True)])
 
     await handle_mention(chat, msg, user(BOT_ID))
 
     assert chat.calls == [("42", "1", "Sam", "ping")]
-    msg.reply.assert_awaited_once()
-    args, kwargs = msg.reply.call_args
-    assert args == ("pong",)
-    assert kwargs["mention_author"] is False
-    assert blocks_all_mentions(kwargs["allowed_mentions"])
+    msg.to_reference.assert_called_once_with(fail_if_not_exists=False)
+    msg.channel.send.assert_awaited_once()
+    call = msg.channel.send.call_args
+    assert call.args == ("pong",)
+    assert call.kwargs["reference"] == "REF"
+    assert call.kwargs["mention_author"] is False
+    assert blocks_all_mentions(call.kwargs["allowed_mentions"])
 
 
-async def test_long_reply_is_split_across_messages():
-    chat = FakeChat("word " * 1000)
+async def test_reply_to_bot_message_is_answered():
+    msg = make_message("and then?", [user(BOT_ID)], type=discord.MessageType.reply)
+    chat = FakeChat()
+    await handle_mention(chat, msg, user(BOT_ID))
+    assert len(chat.calls) == 1
+
+
+async def test_long_reply_is_split_and_only_first_chunk_is_a_reply():
+    reply = " ".join(f"w{i}" for i in range(1500))
+    chat = FakeChat(reply)
     msg = make_message(f"<@{BOT_ID}> essay", [user(BOT_ID)])
 
     await handle_mention(chat, msg, user(BOT_ID))
 
-    msg.reply.assert_awaited_once()
-    assert msg.channel.send.await_count >= 1
-    for call in msg.channel.send.call_args_list:
-        assert len(call.args[0]) <= 2000
-        assert blocks_all_mentions(call.kwargs["allowed_mentions"])
+    calls = msg.channel.send.call_args_list
+    assert len(calls) > 1
+    assert calls[0].kwargs["reference"] == "REF"
+    assert all(c.kwargs["reference"] is None for c in calls[1:])
+    assert all(len(c.args[0]) <= 2000 for c in calls)
+    assert all(blocks_all_mentions(c.kwargs["allowed_mentions"]) for c in calls)
+    assert " ".join(c.args[0] for c in calls) == reply
 
 
 @pytest.mark.parametrize(
@@ -116,6 +167,10 @@ async def test_long_reply_is_split_across_messages():
         {"mentions": []},  # not addressed to the bot
         {"mentions": [user(BOT_ID)], "author": user(2, bot=True)},  # from a bot
         {"mentions": [user(BOT_ID)], "guild": False},  # DM
+        {"mentions": [user(BOT_ID)], "webhook_id": 123},  # webhook
+        # "X added the bot to the thread" system message lists the bot in mentions
+        {"mentions": [user(BOT_ID)], "type": discord.MessageType.recipient_add},
+        {"mentions": [user(BOT_ID)], "type": discord.MessageType.thread_created},
     ],
 )
 async def test_ignored_messages(kwargs):
@@ -123,34 +178,72 @@ async def test_ignored_messages(kwargs):
     msg = make_message("hello", **kwargs)
     await handle_mention(chat, msg, user(BOT_ID))
     assert chat.calls == []
-    msg.reply.assert_not_awaited()
+    msg.channel.send.assert_not_awaited()
 
 
 async def test_unexpected_error_gets_generic_reply():
     chat = FakeChat(error=RuntimeError("boom"))
     msg = make_message(f"<@{BOT_ID}> hi", [user(BOT_ID)])
     await handle_mention(chat, msg, user(BOT_ID))
-    assert msg.reply.call_args.args == (GENERIC_ERROR_REPLY,)
+    assert msg.channel.send.call_args.args == (GENERIC_ERROR_REPLY,)
 
 
-# --- handle_ask ----------------------------------------------------------------
+async def test_silent_reply_sends_nothing():
+    msg = make_message(f"<@{BOT_ID}> hi", [user(BOT_ID)])
+    await handle_mention(FakeChat(reply=None), msg, user(BOT_ID))
+    msg.channel.send.assert_not_awaited()
+
+
+async def test_typing_failure_does_not_block_reply():
+    msg = make_message(f"<@{BOT_ID}> hi", [user(BOT_ID)], typing_error=http_error())
+    await handle_mention(FakeChat("pong"), msg, user(BOT_ID))
+    assert msg.channel.send.call_args.args == ("pong",)
+
+
+async def test_send_failure_is_logged_not_raised(caplog):
+    msg = make_message(f"<@{BOT_ID}> hi", [user(BOT_ID)])
+    msg.channel.send.side_effect = http_error()
+    await handle_mention(FakeChat("pong"), msg, user(BOT_ID))
+    assert "Failed to send reply" in caplog.text
+
+
+# --- slash commands ------------------------------------------------------------
 
 
 async def test_ask_defers_then_follows_up():
     chat = FakeChat("the answer")
-    interaction = SimpleNamespace(
-        channel_id=42,
-        user=user(1),
-        response=SimpleNamespace(defer=AsyncMock()),
-        followup=SimpleNamespace(send=AsyncMock()),
-    )
+    interaction = make_interaction()
 
     await handle_ask(chat, interaction, "the question")
 
     interaction.response.defer.assert_awaited_once_with(thinking=True)
     assert chat.calls == [("42", "1", "Sam", "the question")]
+    assert chat.kwargs == [{"suppress_repeat_notices": False}]
     call = interaction.followup.send.call_args
     assert call.args == ("> the question\n\nthe answer",)
+    assert blocks_all_mentions(call.kwargs["allowed_mentions"])
+
+
+async def test_ask_always_answers_the_deferred_interaction():
+    interaction = make_interaction()
+    await handle_ask(FakeChat(reply=None), interaction, "q")
+    assert GENERIC_ERROR_REPLY in interaction.followup.send.call_args.args[0]
+
+
+async def test_ask_send_failure_is_logged_not_raised(caplog):
+    interaction = make_interaction()
+    interaction.followup.send.side_effect = http_error()
+    await handle_ask(FakeChat(), interaction, "q")
+    assert "Failed to send /ask reply" in caplog.text
+
+
+async def test_reset_clears_channel_and_confirms():
+    chat = FakeChat()
+    interaction = make_interaction()
+    await handle_reset(chat, interaction)
+    assert chat.reset_scopes == ["42"]
+    call = interaction.response.send_message.call_args
+    assert call.args == (RESET_REPLY,)
     assert blocks_all_mentions(call.kwargs["allowed_mentions"])
 
 
@@ -161,17 +254,26 @@ def test_client_is_configured_safely():
     client = CompanionBot(FakeChat(), guild_id=None)
     assert client.intents.message_content is False
     assert blocks_all_mentions(client.allowed_mentions)
+
     ask = client.tree.get_command("ask")
-    assert ask is not None
-    assert ask.guild_only is True
+    assert ask is not None and ask.guild_only is True
+
+    reset = client.tree.get_command("reset")
+    assert reset is not None and reset.guild_only is True
+    assert reset.default_permissions.manage_messages is True
 
 
-async def test_setup_hook_syncs_to_guild_when_configured(monkeypatch):
+async def test_setup_hook_syncs_commands_to_guild_when_configured(monkeypatch):
     client = CompanionBot(FakeChat(), guild_id=123)
     sync = AsyncMock()
     monkeypatch.setattr(client.tree, "sync", sync)
+
     await client.setup_hook()
-    assert sync.call_args.kwargs["guild"].id == 123
+
+    guild = sync.call_args.kwargs["guild"]
+    assert guild.id == 123
+    names = {c.name for c in client.tree.get_commands(guild=discord.Object(id=123))}
+    assert names == {"ask", "reset"}  # commands were actually copied to the guild
 
 
 async def test_setup_hook_syncs_globally_by_default(monkeypatch):
@@ -180,3 +282,10 @@ async def test_setup_hook_syncs_globally_by_default(monkeypatch):
     monkeypatch.setattr(client.tree, "sync", sync)
     await client.setup_hook()
     sync.assert_awaited_once_with()
+
+
+async def test_setup_hook_survives_sync_failure(monkeypatch, caplog):
+    client = CompanionBot(FakeChat(), guild_id=123)
+    monkeypatch.setattr(client.tree, "sync", AsyncMock(side_effect=http_error()))
+    await client.setup_hook()  # must not raise
+    assert "Slash command sync failed" in caplog.text
