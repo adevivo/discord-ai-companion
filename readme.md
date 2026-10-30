@@ -1,3 +1,5 @@
+![Discord AI Companion: your story, your friends, your game master](images/discord-ai-companion-hero.jpeg)
+
 # Discord AI Companion
 
 A private, self-hosted Discord bot that chats using any OpenAI-compatible LLM endpoint. It starts with [OpenRouter](https://openrouter.ai). The longer-term goal is a **Game Master mode**: the bot runs a shared, story-driven adventure for the people in a channel.
@@ -255,3 +257,9 @@ These are parked until the private bot proves useful:
 ## License
 
 [MIT](LICENSE)
+
+---
+
+<p align="center">
+  <img src="images/discord-ai-companion-icon.jpeg" alt="Discord AI Companion lantern icon" width="96">
+</p>
