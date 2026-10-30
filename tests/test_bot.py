@@ -266,6 +266,7 @@ def test_client_is_configured_safely():
     ask = client.tree.get_command("ask")
     assert ask is not None and ask.guild_only is True
 
+    assert client.tree.get_command("help").guild_only is True
     reset = client.tree.get_command("reset")
     assert reset is not None and reset.guild_only is True
     assert reset.default_permissions.manage_messages is True
@@ -283,7 +284,7 @@ async def test_setup_hook_syncs_commands_to_guild_when_configured(monkeypatch, c
     guild = sync.call_args.kwargs["guild"]
     assert guild.id == 123
     names = {c.name for c in client.tree.get_commands(guild=discord.Object(id=123))}
-    assert names == {"ask", "reset"}  # commands were actually copied to the guild
+    assert names == {"ask", "reset", "help"}  # commands were actually copied to the guild
 
 
 async def test_setup_hook_syncs_globally_by_default(monkeypatch):
@@ -299,3 +300,40 @@ async def test_setup_hook_survives_sync_failure(monkeypatch, caplog):
     monkeypatch.setattr(client.tree, "sync", AsyncMock(side_effect=http_error()))
     await client.setup_hook()  # must not raise
     assert "Slash command sync failed" in caplog.text
+
+
+# --- /help ---------------------------------------------------------------------------
+
+
+def test_help_lists_every_registered_command():
+    from companion.bot import build_help
+    from companion.game.engine import GameService
+
+    client = CompanionBot(FakeChat(), games=GameService(llm=None, store=None))
+    text = build_help(client.tree)
+    for name in ("/ask", "/reset", "/help", "/act"):
+        assert f"`{name}`" in text
+    for sub in ("new", "pick", "join", "begin", "status", "recap", "canon", "end"):
+        assert f"`/game {sub}`" in text
+    assert "How an adventure works" in text
+    assert len(text) <= 2000  # fits in one Discord message
+
+
+def test_help_without_game_mode_omits_game_guide():
+    from companion.bot import build_help
+
+    text = build_help(CompanionBot(FakeChat()).tree)
+    assert "`/ask`" in text and "/game" not in text
+
+
+async def test_help_is_private_and_uses_no_llm():
+    from companion.bot import handle_help
+
+    chat = FakeChat()
+    client = CompanionBot(chat)
+    interaction = make_interaction()
+    await handle_help(client.tree, interaction)
+    call = interaction.response.send_message.call_args
+    assert call.kwargs["ephemeral"] is True
+    assert blocks_all_mentions(call.kwargs["allowed_mentions"])
+    assert chat.calls == []

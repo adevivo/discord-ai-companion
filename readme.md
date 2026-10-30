@@ -184,6 +184,7 @@ tests/           # mirrors src; LLM and Discord are faked
   - `@mention` replies in the same channel or thread.
   - Replying to one of the bot's messages counts as a mention, as long as the reply ping is left on.
   - `/ask <prompt>` defers the interaction (Discord requires an acknowledgment within 3 seconds), then posts the answer as a follow-up.
+  - `/help` privately lists every command and explains how to play. It's generated from the registered commands, so it can't go stale. The chat prompt only says "point people to `/help`" and steers RPG requests to `/game new`, which keeps prompts small.
   - `/reset` clears the bot's memory of the current channel or thread. By default it needs Manage Messages; server admins can change that under Server Settings → Integrations.
   - Not triggers: replies with the ping turned off, @mentions of the bot's *role*, system messages, webhooks, and other bots.
 - **Context:** a rolling window of **bot-directed messages only**, per channel or thread: prompts sent to the bot and its replies. Other channel chatter is never used, even though the Message Content intent is on for Game Master mode. Each prompt is stored with the speaker's display name so the bot can tell people apart, and its formatting (newlines, code) is preserved. History is capped by message count and a character budget, and always starts on a user turn. Requests in the same channel are handled one at a time, so each sees the previous exchange. Context lives in SQLite and survives restarts. An exchange is only stored if the LLM answered.

@@ -135,6 +135,37 @@ async def handle_ask(chat: ChatService, interaction, prompt: str) -> None:
     log.info("Answered /ask (scope=%s, messages=%d)", interaction.channel_id, len(chunks))
 
 
+HOW_TO_PLAY = (
+    "**How an adventure works**\n"
+    "1. `/game new` in a regular channel opens a thread (leave genre blank for GM pitches).\n"
+    "2. Everyone runs `/game join` in the thread; the host runs `/game begin`.\n"
+    "3. Each round, write what your character does in the thread, then `/act`.\n"
+    "4. The round resolves when everyone has acted, or at the deadline.\n"
+    "-# Start a message with `((` or `//` to keep it out of the story."
+)
+
+
+def build_help(tree: app_commands.CommandTree) -> str:
+    """Command list generated from what's actually registered, so it can't go stale."""
+    lines = ["**Commands**", "`@mention` me to chat in any channel"]
+    for command in tree.get_commands():
+        if isinstance(command, app_commands.Group):
+            lines += [
+                f"`/{command.name} {sub.name}`: {sub.description}" for sub in command.commands
+            ]
+        else:
+            lines.append(f"`/{command.name}`: {command.description}")
+    if tree.get_command("game") is not None:
+        lines += ["", HOW_TO_PLAY]
+    return "\n".join(lines)
+
+
+async def handle_help(tree: app_commands.CommandTree, interaction) -> None:
+    await interaction.response.send_message(
+        build_help(tree), ephemeral=True, allowed_mentions=NO_MENTIONS
+    )
+
+
 async def handle_reset(chat: ChatService, interaction) -> None:
     removed = await chat.reset(str(interaction.channel_id))
     log.info("Context reset (scope=%s, messages=%d)", interaction.channel_id, removed)
@@ -170,6 +201,11 @@ class CompanionBot(discord.Client):
         @app_commands.default_permissions(manage_messages=True)
         async def reset(interaction: discord.Interaction) -> None:
             await handle_reset(self.chat, interaction)
+
+        @self.tree.command(name="help", description="What I can do and how to play")
+        @app_commands.guild_only()
+        async def help_(interaction: discord.Interaction) -> None:
+            await handle_help(self.tree, interaction)
 
     async def setup_hook(self) -> None:
         if self.games is not None:

@@ -77,6 +77,7 @@ async def test_builds_prompt_and_stores_exchange(store):
     assert sent[0].role == "system"
     assert sent[0].content.startswith("Be nice.")
     assert "display name" in sent[0].content
+    assert "`/help`" in sent[0].content and "`/game new`" in sent[0].content
     assert sent[-1] == ChatMessage("user", "Sam: hi there")
     assert await store.recent("chan", 10) == [
         ChatMessage("user", "Sam: hi there"),

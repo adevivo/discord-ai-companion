@@ -26,6 +26,14 @@ SPEAKER_NOTE = (
     'Each user message is prefixed with the speaker\'s display name, e.g. "Sam: hello".'
 )
 
+# Kept short on purpose: the full command list lives behind /help, not in every prompt.
+BOT_NOTE = (
+    "\n\nYou are a Discord bot with slash commands. If someone asks what you can do or how "
+    "to use you, tell them to run `/help`. Don't invent commands. If someone wants to play an "
+    "RPG or go on an adventure, recommend Game Master mode: `/game new` in a channel starts "
+    "one in its own thread (details in `/help`). Don't run an improvised game in chat."
+)
+
 EMPTY_PROMPT_REPLY = "You pinged me but didn't say anything. What can I help with?"
 PROMPT_TOO_LONG_REPLY = (
     f"That message is too long for me. Please keep it under {MAX_PROMPT_CHARS} characters."
@@ -62,7 +70,7 @@ class ChatService:
         self._store = store
         self._user_limiter = user_limiter
         self._global_limiter = global_limiter
-        self._system_prompt = system_prompt + SPEAKER_NOTE
+        self._system_prompt = system_prompt + SPEAKER_NOTE + BOT_NOTE
         self._context_messages = context_messages
         self._context_max_chars = context_max_chars
         self._clock = clock
