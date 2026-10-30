@@ -111,3 +111,15 @@ def test_optional_ints_parse(monkeypatch):
     _set_env(monkeypatch, DISCORD_GUILD_ID="123", LLM_MAX_TOKENS="800")
     s = Settings(_env_file=None)
     assert (s.discord_guild_id, s.llm_max_tokens) == (123, 800)
+
+
+def test_game_settings(monkeypatch):
+    _set_env(monkeypatch)
+    s = Settings(_env_file=None)
+    assert (s.game_round_hours, s.game_target_rounds) == (24.0, 12)
+    _set_env(monkeypatch, GAME_ROUND_HOURS="0.5", GAME_TARGET_ROUNDS="6")
+    s = Settings(_env_file=None)
+    assert (s.game_round_hours, s.game_target_rounds) == (0.5, 6)
+    _set_env(monkeypatch, GAME_TARGET_ROUNDS="2")
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)

@@ -41,6 +41,10 @@ class Settings(BaseSettings):
     # Across all users: protects the provider account's quota.
     global_rate_limit_per_minute: int = Field(default=20, ge=1)
 
+    # Game Master mode
+    game_round_hours: float = Field(default=24.0, gt=0)
+    game_target_rounds: int = Field(default=12, ge=3)
+
     # Storage
     database_path: Path = Path("data/companion.db")
 

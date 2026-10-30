@@ -1,16 +1,19 @@
-"""Discord adapter: turns @mentions, /ask and /reset into ChatService calls.
+"""Discord adapter: turns @mentions, /ask and /reset into ChatService calls,
+and hosts Game Master mode (see companion.game.commands).
 
 Kept deliberately thin. The handler functions take duck-typed Discord objects
 so they can be tested without a gateway connection.
 
 Security notes:
-- Only bot-directed messages are processed; the privileged Message Content
-  intent is not requested.
+- Chat mode only processes bot-directed messages. The Message Content intent
+  is enabled for Game Master mode, but message text is only used inside
+  active game threads; everywhere else it is ignored.
 - All outgoing messages use AllowedMentions.none(), so LLM output can never
   ping @everyone, roles, or users.
 - Server-only: DMs are ignored and slash commands are guild-only.
 """
 
+import asyncio
 import contextlib
 import logging
 import re
@@ -19,6 +22,8 @@ import discord
 from discord import app_commands
 
 from companion.chat import ChatService
+from companion.game.commands import deliver_due, handle_game_message, register_game_commands
+from companion.game.engine import GameService
 from companion.splitter import split_message
 
 log = logging.getLogger(__name__)
@@ -29,6 +34,7 @@ RESET_REPLY = "Conversation memory for this channel has been cleared."
 _USER_MESSAGE_TYPES = (discord.MessageType.default, discord.MessageType.reply)
 _USER_MENTION = re.compile(r"<@!?(\d+)>")
 _ASK_QUOTE_MAX = 200
+DEADLINE_CHECK_SECONDS = 60
 
 
 def prepare_prompt(content: str, bot_id: int, mention_names: dict[int, str]) -> str:
@@ -136,14 +142,21 @@ async def handle_reset(chat: ChatService, interaction) -> None:
 
 
 class CompanionBot(discord.Client):
-    def __init__(self, chat: ChatService, guild_id: int | None = None) -> None:
+    def __init__(
+        self, chat: ChatService, guild_id: int | None = None, games: GameService | None = None
+    ) -> None:
         intents = discord.Intents.default()
-        intents.message_content = False  # bot-directed messages only
+        # Needed to read in-character chat in game threads; ignored elsewhere.
+        intents.message_content = games is not None
         super().__init__(intents=intents, allowed_mentions=NO_MENTIONS)
         self.chat = chat
+        self.games = games
         self.guild_id = guild_id
         self.tree = app_commands.CommandTree(self)
         self._register_commands()
+        if games is not None:
+            register_game_commands(self.tree, games)
+        self._deadline_task: asyncio.Task | None = None
 
     def _register_commands(self) -> None:
         @self.tree.command(name="ask", description="Ask the AI a question")
@@ -159,6 +172,8 @@ class CompanionBot(discord.Client):
             await handle_reset(self.chat, interaction)
 
     async def setup_hook(self) -> None:
+        if self.games is not None:
+            self._deadline_task = asyncio.create_task(self._deadline_loop())
         try:
             if self.guild_id is not None:
                 # Guild sync is instant; handy during development.
@@ -182,5 +197,26 @@ class CompanionBot(discord.Client):
         log.info("Connected as %s (guilds=%d)", self.user, len(self.guilds))
 
     async def on_message(self, message: discord.Message) -> None:
-        if self.user is not None:
-            await handle_mention(self.chat, message, self.user)
+        if self.user is None:
+            return
+        # Game threads belong to the GM; chat mode doesn't answer there.
+        if self.games is not None and await handle_game_message(self.games, message):
+            return
+        await handle_mention(self.chat, message, self.user)
+
+    async def close(self) -> None:
+        if self._deadline_task is not None:
+            self._deadline_task.cancel()
+        await super().close()
+
+    async def _get_channel(self, channel_id: int):
+        return self.get_channel(channel_id) or await self.fetch_channel(channel_id)
+
+    async def _deadline_loop(self) -> None:
+        await self.wait_until_ready()
+        while not self.is_closed():
+            try:
+                await deliver_due(self.games, self._get_channel)
+            except Exception:
+                log.exception("Deadline check failed")
+            await asyncio.sleep(DEADLINE_CHECK_SECONDS)

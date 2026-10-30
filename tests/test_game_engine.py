@@ -448,3 +448,15 @@ async def test_end_permissions(env):
     assert result.posts == ["🏁 The host has ended this adventure."]
     assert (await store.game_for_thread("t")).status is Status.ENDED
     assert "no round in progress" in (await service.act("t", "host")).message
+
+
+async def test_abandon_stops_a_game_whose_thread_is_gone(env):
+    service, store, llm, clock = env
+    await started_game(service)
+    await service.abandon("t")
+    assert (await store.game_for_thread("t")).status is Status.ENDED
+    clock.now += 48 * HOUR
+    calls = len(llm.calls)
+    assert await service.tick() == []
+    assert len(llm.calls) == calls  # no more LLM spend
+    await service.abandon("missing")  # unknown threads are ignored

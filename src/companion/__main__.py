@@ -12,6 +12,9 @@ from pydantic import ValidationError
 from companion.bot import CompanionBot
 from companion.chat import ChatService
 from companion.config import Settings
+from companion.db import connect
+from companion.game.engine import GameService
+from companion.game.store import GameStore
 from companion.llm import LLMClient
 from companion.ratelimit import RateLimiter
 from companion.store import ContextStore
@@ -20,7 +23,8 @@ log = logging.getLogger("companion")
 
 
 async def run(settings: Settings) -> None:
-    store = await ContextStore.open(settings.database_path)
+    db = await connect(settings.database_path)
+    store = ContextStore(db)
     llm = LLMClient(settings)
     try:
         chat = ChatService(
@@ -32,7 +36,13 @@ async def run(settings: Settings) -> None:
             context_messages=settings.context_messages,
             context_max_chars=settings.context_max_chars,
         )
-        bot = CompanionBot(chat, guild_id=settings.discord_guild_id)
+        games = GameService(
+            llm,
+            GameStore(db),
+            round_hours=settings.game_round_hours,
+            target_rounds=settings.game_target_rounds,
+        )
+        bot = CompanionBot(chat, guild_id=settings.discord_guild_id, games=games)
 
         # `docker stop` sends SIGTERM; close the gateway connection cleanly.
         # Keep a reference to the task so it can't be garbage-collected mid-flight.
@@ -69,6 +79,12 @@ def main() -> int:
         asyncio.run(run(settings))
     except discord.LoginFailure:
         log.error("Discord rejected the bot token. Check DISCORD_TOKEN.")
+        return 1
+    except discord.PrivilegedIntentsRequired:
+        log.error(
+            "Discord refused the Message Content intent. Enable it in the Developer Portal: "
+            "your app -> Bot -> Privileged Gateway Intents -> Message Content Intent."
+        )
         return 1
     except KeyboardInterrupt:
         pass

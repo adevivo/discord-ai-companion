@@ -4,7 +4,7 @@
 
 A private, self-hosted Discord bot that chats using any OpenAI-compatible LLM endpoint. It starts with [OpenRouter](https://openrouter.ai). The longer-term goal is a **Game Master mode**: the bot runs a shared, story-driven adventure for the people in a channel.
 
-> **Status:** Chat MVP is live-tested and working. Game Master mode is being designed. See [Roadmap](#roadmap).
+> **Status:** Chat MVP is live-tested and working. Game Master mode is built and tested, and awaiting its first live game. See [Roadmap](#roadmap).
 
 ## Roadmap
 
@@ -12,7 +12,7 @@ A private, self-hosted Discord bot that chats using any OpenAI-compatible LLM en
 |---|---|---|
 | 0 | Project scaffold, config, LLM client, message splitter, Docker stack | Done |
 | 1 | Chat MVP: Discord connection, `@mention` + `/ask`, SQLite context, rate limiting | Done |
-| 2 | Game Master mode | In design |
+| 2 | Game Master mode | Built; awaiting live test |
 | Later | Public-bot features (see [Future](#future-public-bot-considerations)) | Parked |
 
 ## Architecture
@@ -74,10 +74,11 @@ A private bot needs no approval or review. A "bot" is just an *application* you 
 2. On the **Bot** tab:
    - Reset and copy the **token**. It goes in `.env` and is never committed.
    - Turn **Public Bot** off so only the owner can invite it. If you get *"Private application cannot have a default authorization link"*, first go to **Installation**, set **Install Link** to **None**, save, then try again.
-   - Leave **Message Content Intent** off unless we decide to read non-mention messages. Mentions, DMs, and slash commands work without it.
+   - Turn **Message Content Intent** on. Game Master mode needs it to read in-character chat in game threads; the bot ignores message text everywhere else. Without it, the bot refuses to start and logs how to fix it.
 3. Under **OAuth2 → URL Generator**:
    - Scopes: `bot`, `applications.commands`
-   - Bot permissions: View Channels, Send Messages, Send Messages in Threads, Read Message History
+   - Bot permissions: View Channels, Send Messages, Send Messages in Threads, **Create Public Threads**, Read Message History
+   - Already invited the bot? Open the new URL again and authorize. That updates the bot's permissions in place.
 4. Open the generated URL and add the bot to your server. You need Manage Server permission there.
 
 Discord verification only applies once a bot reaches **100 servers**.
@@ -99,12 +100,14 @@ cp .env.example .env
 | `LLM_BASE_URL` | | `https://openrouter.ai/api/v1` | Any OpenAI-compatible endpoint |
 | `LLM_TIMEOUT_SECONDS` | | `60` | Per-request timeout |
 | `LLM_MAX_RETRIES` | | `1` | Retries on transient errors |
-| `LLM_MAX_TOKENS` | | provider default | Cap on reply length. Replies cut off at the cap are marked *(reply truncated)*. |
+| `LLM_MAX_TOKENS` | | provider default | Cap on reply length. Replies cut off at the cap are marked *(reply truncated)*. Game setup returns a lot of JSON, so leave this unset or keep it at 3000 or more. |
 | `SYSTEM_PROMPT` | | friendly assistant | Bot persona and instructions |
 | `CONTEXT_MESSAGES` | | `20` | Recent messages kept and sent as context |
 | `CONTEXT_MAX_CHARS` | | `24000` | Character budget for context, so history can't outgrow the model's context window |
 | `RATE_LIMIT_PER_MINUTE` | | `5` | Per-user request limit |
 | `GLOBAL_RATE_LIMIT_PER_MINUTE` | | `20` | Limit across all users, to protect the provider account's quota |
+| `GAME_ROUND_HOURS` | | `24` | Round deadline in Game Master mode (reminder at the halfway point) |
+| `GAME_TARGET_ROUNDS` | | `12` | Target adventure length in rounds (hard stop 2 rounds later) |
 | `DATABASE_PATH` | | `data/companion.db` (`/data/companion.db` in Docker) | SQLite file location |
 
 Secrets are typed as `SecretStr`, so they're masked in logs and error output. If required values are missing, startup fails fast and names the missing variables, never their values.
@@ -145,13 +148,22 @@ Layout:
 ```
 src/companion/
   config.py      # settings from env, validated, secrets masked
+  db.py          # shared SQLite connection and schema
   llm.py         # OpenAI-compatible chat client + error mapping
-  store.py       # SQLite conversation context per channel/thread
-  ratelimit.py   # per-user sliding-window rate limiter
-  chat.py        # conversation logic (prompt building, errors), Discord-free
-  bot.py         # thin Discord adapter: @mention, /ask
+  structured.py  # validated JSON from the LLM, with corrective retries
+  store.py       # chat context per channel/thread
+  ratelimit.py   # sliding-window rate limiter
+  chat.py        # chat logic (prompt building, errors), Discord-free
+  bot.py         # Discord client: @mention, /ask, /reset, message routing
   splitter.py    # split replies to Discord's 2000-char limit, code-block aware
   __main__.py    # entry point (python -m companion)
+  game/
+    store.py     # games, players, round posts, story bible
+    dice.py      # 2d6 with success / partial / failure
+    schemas.py   # JSON shapes the GM must return
+    prompts.py   # the GM's prompts (review these, they shape behaviour)
+    engine.py    # game lifecycle, rounds, deadlines; Discord-free
+    commands.py  # /game and /act commands, thread chat, deadline delivery
 tests/           # mirrors src; LLM and Discord are faked
 ```
 
@@ -174,7 +186,7 @@ tests/           # mirrors src; LLM and Discord are faked
   - `/ask <prompt>` defers the interaction (Discord requires an acknowledgment within 3 seconds), then posts the answer as a follow-up.
   - `/reset` clears the bot's memory of the current channel or thread. By default it needs Manage Messages; server admins can change that under Server Settings → Integrations.
   - Not triggers: replies with the ping turned off, @mentions of the bot's *role*, system messages, webhooks, and other bots.
-- **Context:** a rolling window of **bot-directed messages only**, per channel or thread: prompts sent to the bot and its replies. Other channel chatter is never read, so the privileged Message Content intent isn't needed. Each prompt is stored with the speaker's display name so the bot can tell people apart, and its formatting (newlines, code) is preserved. History is capped by message count and a character budget, and always starts on a user turn. Requests in the same channel are handled one at a time, so each sees the previous exchange. Context lives in SQLite and survives restarts. An exchange is only stored if the LLM answered.
+- **Context:** a rolling window of **bot-directed messages only**, per channel or thread: prompts sent to the bot and its replies. Other channel chatter is never used, even though the Message Content intent is on for Game Master mode. Each prompt is stored with the speaker's display name so the bot can tell people apart, and its formatting (newlines, code) is preserved. History is capped by message count and a character budget, and always starts on a user turn. Requests in the same channel are handled one at a time, so each sees the previous exchange. Context lives in SQLite and survives restarts. An exchange is only stored if the LLM answered.
 - **Server-only:** DMs are ignored and slash commands are guild-only. This stops people outside the server from using up the API quota.
 - **Mention safety:** all bot messages are sent with mentions disabled, so LLM output can never ping `@everyone`, roles, or users.
 - **Output:** replies over 2000 characters are split at paragraph, line, or word boundaries. Code blocks are closed and reopened across chunks. No streaming, because repeatedly editing a message hits Discord rate limits.

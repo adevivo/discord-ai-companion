@@ -407,6 +407,14 @@ class GameService:
             await self._store.update_game(game.id, status=Status.ENDED, round_deadline=None)
         return Result("Game ended.", posts=["🏁 The host has ended this adventure."])
 
+    async def abandon(self, thread_id: str) -> None:
+        """End a game whose thread no longer exists, so it stops consuming LLM calls."""
+        game = await self._store.game_for_thread(thread_id)
+        if game is not None and game.status is not Status.ENDED:
+            log.warning("Abandoning game whose thread is gone (thread=%s)", thread_id)
+            async with self._locks[thread_id]:
+                await self._store.update_game(game.id, status=Status.ENDED, round_deadline=None)
+
 
 def _assign_characters(
     players: list[Player], characters: list[PlayerCharacter]
