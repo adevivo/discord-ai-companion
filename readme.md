@@ -1,4 +1,4 @@
-![Discord AI Companion: your story, your friends, your game master](images/discord-ai-companion-hero.jpeg)
+![Discord AI Companion: your story, your friends, your game master](images/discord-ai-companion-hero-web.jpeg)
 
 # Discord AI Companion
 
