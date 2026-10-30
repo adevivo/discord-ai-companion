@@ -4,15 +4,15 @@
 
 A private, self-hosted Discord bot that chats using any OpenAI-compatible LLM endpoint. It starts with [OpenRouter](https://openrouter.ai). The longer-term goal is a **Game Master mode**: the bot runs a shared, story-driven adventure for the people in a channel.
 
-> **Status:** Chat MVP is code-complete and tested. Next step: a live test against a real Discord server. See [Roadmap](#roadmap).
+> **Status:** Chat MVP is live-tested and working. Game Master mode is being designed. See [Roadmap](#roadmap).
 
 ## Roadmap
 
 | Phase | Scope | Status |
 |---|---|---|
 | 0 | Project scaffold, config, LLM client, message splitter, Docker stack | Done |
-| 1 | Chat MVP: Discord connection, `@mention` + `/ask`, SQLite context, rate limiting | Built; awaiting live test |
-| 2 | Game Master mode | Designed, not started |
+| 1 | Chat MVP: Discord connection, `@mention` + `/ask`, SQLite context, rate limiting | Done |
+| 2 | Game Master mode | In design |
 | Later | Public-bot features (see [Future](#future-public-bot-considerations)) | Parked |
 
 ## Architecture
@@ -73,7 +73,7 @@ A private bot needs no approval or review. A "bot" is just an *application* you 
 1. In the [Discord Developer Portal](https://discord.com/developers/applications), click **New Application** and give it a name.
 2. On the **Bot** tab:
    - Reset and copy the **token**. It goes in `.env` and is never committed.
-   - Turn **Public Bot** off so only the owner can invite it.
+   - Turn **Public Bot** off so only the owner can invite it. If you get *"Private application cannot have a default authorization link"*, first go to **Installation**, set **Install Link** to **None**, save, then try again.
    - Leave **Message Content Intent** off unless we decide to read non-mention messages. Mentions, DMs, and slash commands work without it.
 3. Under **OAuth2 → URL Generator**:
    - Scopes: `bot`, `applications.commands`

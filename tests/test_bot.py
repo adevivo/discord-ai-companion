@@ -161,6 +161,14 @@ async def test_long_reply_is_split_and_only_first_chunk_is_a_reply():
     assert " ".join(c.args[0] for c in calls) == reply
 
 
+async def test_reply_logs_message_count(caplog):
+    caplog.set_level("INFO")
+    msg = make_message(f"<@{BOT_ID}> essay", [user(BOT_ID)])
+    await handle_mention(FakeChat(" ".join(f"w{i}" for i in range(1500))), msg, user(BOT_ID))
+    count = msg.channel.send.await_count
+    assert f"Replied (scope=42, messages={count})" in caplog.text
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [
@@ -263,13 +271,15 @@ def test_client_is_configured_safely():
     assert reset.default_permissions.manage_messages is True
 
 
-async def test_setup_hook_syncs_commands_to_guild_when_configured(monkeypatch):
+async def test_setup_hook_syncs_commands_to_guild_when_configured(monkeypatch, caplog):
     client = CompanionBot(FakeChat(), guild_id=123)
-    sync = AsyncMock()
+    sync = AsyncMock(return_value=["ask", "reset"])
     monkeypatch.setattr(client.tree, "sync", sync)
+    caplog.set_level("INFO")
 
     await client.setup_hook()
 
+    assert "Synced 2 slash commands to guild 123" in caplog.text
     guild = sync.call_args.kwargs["guild"]
     assert guild.id == 123
     names = {c.name for c in client.tree.get_commands(guild=discord.Object(id=123))}

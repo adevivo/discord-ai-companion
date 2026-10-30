@@ -94,8 +94,9 @@ async def handle_mention(chat: ChatService, message, bot_user) -> None:
 
     # If the user deleted their message while we waited, post without the reply link.
     reference = message.to_reference(fail_if_not_exists=False)
+    chunks = split_message(reply)
     try:
-        for i, chunk in enumerate(split_message(reply)):
+        for i, chunk in enumerate(chunks):
             await message.channel.send(
                 chunk,
                 reference=reference if i == 0 else None,
@@ -104,6 +105,8 @@ async def handle_mention(chat: ChatService, message, bot_user) -> None:
             )
     except discord.HTTPException:
         log.exception("Failed to send reply (scope=%s)", message.channel.id)
+        return
+    log.info("Replied (scope=%s, messages=%d)", message.channel.id, len(chunks))
 
 
 async def handle_ask(chat: ChatService, interaction, prompt: str) -> None:
@@ -116,11 +119,14 @@ async def handle_ask(chat: ChatService, interaction, prompt: str) -> None:
         prompt,
         suppress_repeat_notices=False,  # the deferred "thinking" state needs an answer
     )
+    chunks = split_message(format_ask_reply(prompt, reply or GENERIC_ERROR_REPLY))
     try:
-        for chunk in split_message(format_ask_reply(prompt, reply or GENERIC_ERROR_REPLY)):
+        for chunk in chunks:
             await interaction.followup.send(chunk, allowed_mentions=NO_MENTIONS)
     except discord.HTTPException:
         log.exception("Failed to send /ask reply (scope=%s)", interaction.channel_id)
+        return
+    log.info("Answered /ask (scope=%s, messages=%d)", interaction.channel_id, len(chunks))
 
 
 async def handle_reset(chat: ChatService, interaction) -> None:
@@ -158,9 +164,13 @@ class CompanionBot(discord.Client):
                 # Guild sync is instant; handy during development.
                 guild = discord.Object(id=self.guild_id)
                 self.tree.copy_global_to(guild=guild)
-                await self.tree.sync(guild=guild)
+                synced = await self.tree.sync(guild=guild)
+                log.info("Synced %d slash commands to guild %s", len(synced), self.guild_id)
             else:
-                await self.tree.sync()
+                synced = await self.tree.sync()
+                log.info(
+                    "Synced %d slash commands globally (may take a while to appear)", len(synced)
+                )
         except discord.HTTPException:
             # Don't crash-loop: @mentions still work without slash commands.
             log.exception(
