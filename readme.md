@@ -200,34 +200,52 @@ Long AI roleplay usually degrades for four reasons: the transcript is the only m
 | Nothing is canonical | **Story bible** in the DB: characters, NPCs, places, significant items, established facts, open threads. |
 | Transcript grows until details fade | **Prompt rebuilt fresh each round** from the outline, current act, bible, rolling summary, and the last few rounds only. |
 | New facts get lost | **Canon extraction:** each round the LLM returns new or changed facts as JSON, which code validates and stores. |
-| Drift goes uncorrected | **Player tools:** `/recap`, `/canon`, and a way to flag contradictions. |
+| Drift goes uncorrected | **Player tools:** `/game recap` and `/game canon` let the table spot and call out contradictions in character. |
 
 This greatly reduces drift but cannot eliminate it. Model choice matters, especially for following the facts given in the prompt and for producing reliable JSON.
 
 ### Structured output (prerequisite)
 Game state updates come back from the LLM as JSON, so parsing, validating, and retrying JSON responses will be a first-class, tested component. We won't rely on native tool calling, since support is inconsistent across models.
 
+### How a game flows
+Games are **asynchronous**, played over days in a dedicated thread.
+
+1. **`/game new genre:<text>`** in any regular channel. The bot opens a thread for the game, and the person who ran it is the **host**. The genre is free text, e.g. "cyberpunk heist" or "modern day, but the town's clocks run backwards". Leave it blank and the GM pitches three premises; the host chooses with **`/game pick`**.
+2. **`/game join concept:<optional hint>`** in the thread. The GM creates each character, using the player's hint if given ("burned-out ex-cop who owes a fixer money"). **Late joiners** are welcome: their character is created on the spot and written into the story.
+3. **`/game begin`** (host only). The GM writes a hidden outline, posts character cards, and opens round 1.
+4. **Each round**, players post freely **in character** in the thread over the day. Messages starting with `((` or `//` are out-of-character and ignored. When a player is done, they use **`/act`** (optionally with a final note).
+5. The round **resolves** when every player has acted or the **24-hour deadline** passes. Players who didn't act follow the group's lead. At the halfway point, the bot pings only the players who haven't acted yet.
+6. The adventure targets **about 12 rounds**. The GM steers toward an ending, posts an epilogue, and the game closes.
+
+Other commands: **`/game status`** (who's still to act, and the deadline), **`/game recap`** (story so far), **`/game canon`** (established facts), **`/game end`** (host or moderator).
+
 ### Light mechanics
-- Code rolls dice only when an outcome is uncertain. Results are **success / partial success / failure**.
-- **Conditions** ("wounded", "lost the map", "owes the smugglers") replace HP and stats.
+- **Rolls:** each round the code rolls **2d6** for every player. **10+** is a success, **7–9** a partial success (with a cost or complication), and **6 or less** a failure that still moves the story forward.
+- **When rolls count:** the LLM applies a player's roll only when their action was risky. It reports which rolls it used, and those are shown publicly (e.g. `🎲 Sam (Vex): partial success (8)`), so the dice are honest and visible.
+- **No HP or stats:** narrative conditions ("wounded", "lost the map", "owes the smugglers") take their place.
+- **Tone:** the GM keeps content fairly tame (roughly PG-13). There is no per-game setting.
 
-### Turn flow: collect, then resolve
-1. The GM narrates the scene and opens a round.
-2. Players each submit an action (`/act ...`) in any order.
-3. When all players have acted, or a timeout expires, code resolves the rolls and the LLM narrates the round in one reply, then updates canon.
+### Reliability
+- **One LLM call per round** for resolution, which returns narration, canon updates, an updated summary, and the current act as validated JSON.
+- **Deadlines** are stored in SQLite, so a restart doesn't lose them. A background check runs every minute.
+- **LLM failures:** if the LLM fails during resolution, the round stays open and is retried every 10 minutes.
+- **Prompt injection:** player text is passed to the LLM as clearly delimited, untrusted in-character content.
 
-This avoids blocking on AFK players and keeps LLM usage to about 1–2 calls per round.
+### Discord requirements
+- **Message Content intent:** must be enabled in the Developer Portal (Bot → Privileged Gateway Intents) so the GM can read in-character chat. The code ignores message content everywhere except active game threads, so **only game-thread chat is sent to the LLM provider**. Tell players this.
+- **Create Public Threads:** the bot needs this permission, in addition to the chat permissions.
+- **Thread archiving:** game threads use Discord's longest auto-archive window (1 week), and a bot post re-opens an archived thread.
 
 ## AI Provider and Privacy
 
-We start with **OpenRouter free models**. The bot depends only on basic `/v1/chat/completions`.
+We use **OpenRouter**, either with free models or with cheap paid ones. Paid models are noticeably more reliable for Game Master mode's narration and JSON. The bot depends only on basic `/v1/chat/completions`.
 
 Caveats with free models (check OpenRouter's current docs, since limits change):
 - **Tight request limits,** both per minute and per day. The daily cap is higher once credits have been purchased.
 - **Models come and go,** so the configured model may disappear.
 - **Prompt logging:** some free providers may log prompts or train on them.
 
-**Privacy:** messages the bot uses as context are sent to the configured LLM provider. Server members should be told this, for example with a pinned note in the channels where the bot is active.
+**Privacy:** messages the bot uses as context are sent to the configured LLM provider. In chat mode that means only bot-directed messages; in Game Master mode it also includes everything posted in active game threads. Server members should be told this, for example with a pinned note in the channels where the bot is active.
 
 ## Open Questions
 
@@ -236,13 +254,7 @@ Caveats with free models (check OpenRouter's current docs, since limits change):
 - [ ] **Persona:** one fixed system prompt, or a configurable personality?
 - [ ] **Channels:** active everywhere, or only in an allowlist?
 
-**Game Master mode**
-- [ ] **Pacing:** live sessions, async over days, or both? This affects timeouts and nudges.
-- [x] **Scope:** a game lives in its own sub-channel. `/game start` opens a Discord thread, and game state is keyed to that thread's ID. Game input uses slash commands (`/act`), so it's bot-directed and needs no extra intents.
-- [ ] **Free-form roleplay:** should the GM also read in-character chat in the game thread, beyond `/act`? That would require the Message Content intent.
-- [ ] **Characters:** quick player-made concept (name, one-line concept, a trait or two), or GM-generated?
-- [ ] **Premise:** do players pick genre and tone at start, or does the GM pitch options?
-- [ ] **Length:** one session (~2h), or several?
+**Game Master mode**: all resolved (see [How a game flows](#how-a-game-flows)): async over days, a thread per game, GM-made characters from optional player hints, player-chosen genre or GM pitches, about 12 rounds, and in-character chat read from the thread.
 
 ## Future: Public-Bot Considerations
 

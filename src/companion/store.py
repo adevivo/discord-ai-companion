@@ -7,18 +7,8 @@ from pathlib import Path
 
 import aiosqlite
 
+from companion.db import connect
 from companion.llm import ChatMessage
-
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS messages (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    scope_id   TEXT    NOT NULL,
-    role       TEXT    NOT NULL CHECK (role IN ('user', 'assistant')),
-    content    TEXT    NOT NULL,
-    created_at TEXT    NOT NULL DEFAULT (datetime('now'))
-);
-CREATE INDEX IF NOT EXISTS idx_messages_scope ON messages (scope_id, id);
-"""
 
 
 class ContextStore:
@@ -27,12 +17,7 @@ class ContextStore:
 
     @classmethod
     async def open(cls, path: Path | str) -> "ContextStore":
-        if str(path) != ":memory:":
-            Path(path).parent.mkdir(parents=True, exist_ok=True)
-        db = await aiosqlite.connect(path)
-        await db.executescript(_SCHEMA)
-        await db.commit()
-        return cls(db)
+        return cls(await connect(path))
 
     async def close(self) -> None:
         await self._db.close()
