@@ -1,0 +1,25 @@
+services:
+  bot:
+    build: .
+    image: discord-ai-companion:latest
+    container_name: discord-ai-companion
+    env_file: .env
+    volumes:
+      - companion-data:/data
+    restart: unless-stopped
+    # No ports: the bot only makes outbound connections (Discord gateway, LLM API).
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  companion-data:

@@ -1,0 +1,72 @@
+from pathlib import Path
+
+import pytest
+from pydantic import ValidationError
+
+from companion.__main__ import main
+from companion.config import Settings
+
+REQUIRED = {"DISCORD_TOKEN": "discord-secret", "LLM_API_KEY": "llm-secret", "LLM_MODEL": "m"}
+
+
+def _set_env(monkeypatch, **overrides):
+    for name, value in {**REQUIRED, **overrides}.items():
+        monkeypatch.setenv(name, value)
+
+
+def test_loads_from_environment_with_defaults(monkeypatch):
+    _set_env(monkeypatch)
+    s = Settings(_env_file=None)
+    assert s.discord_token.get_secret_value() == "discord-secret"
+    assert s.llm_api_key.get_secret_value() == "llm-secret"
+    assert s.llm_base_url == "https://openrouter.ai/api/v1"
+    assert s.context_messages == 20
+    assert s.database_path == Path("data/companion.db")
+
+
+@pytest.mark.parametrize("missing", sorted(REQUIRED))
+def test_missing_required_value_fails(monkeypatch, missing):
+    _set_env(monkeypatch)
+    monkeypatch.delenv(missing)
+    with pytest.raises(ValidationError) as exc:
+        Settings(_env_file=None)
+    assert missing.lower() in str(exc.value)
+
+
+def test_empty_model_is_rejected(monkeypatch):
+    _set_env(monkeypatch, LLM_MODEL="")
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
+
+
+@pytest.mark.parametrize(
+    "name,value", [("LLM_TIMEOUT_SECONDS", "0"), ("RATE_LIMIT_PER_MINUTE", "0")]
+)
+def test_invalid_numbers_are_rejected(monkeypatch, name, value):
+    _set_env(monkeypatch, **{name: value})
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
+
+
+def test_secrets_are_masked_in_repr_and_str(monkeypatch):
+    _set_env(monkeypatch)
+    s = Settings(_env_file=None)
+    for rendered in (repr(s), str(s), s.model_dump_json()):
+        assert "discord-secret" not in rendered
+        assert "llm-secret" not in rendered
+
+
+def test_main_reports_missing_config_without_leaking_secrets(monkeypatch, caplog):
+    monkeypatch.setenv("LLM_API_KEY", "llm-secret")
+    monkeypatch.chdir(Path(__file__).parent)  # ensure no stray .env is picked up
+    assert main() == 1
+    assert "DISCORD_TOKEN" in caplog.text
+    assert "llm-secret" not in caplog.text
+
+
+def test_main_succeeds_with_valid_config(monkeypatch, caplog):
+    _set_env(monkeypatch)
+    monkeypatch.chdir(Path(__file__).parent)
+    assert main() == 0
+    assert "discord-secret" not in caplog.text
+    assert "llm-secret" not in caplog.text
