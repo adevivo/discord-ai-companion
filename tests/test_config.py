@@ -1,8 +1,10 @@
 from pathlib import Path
 
+import discord
 import pytest
 from pydantic import ValidationError
 
+from companion import __main__ as entry
 from companion.__main__ import main
 from companion.config import Settings
 
@@ -64,9 +66,29 @@ def test_main_reports_missing_config_without_leaking_secrets(monkeypatch, caplog
     assert "llm-secret" not in caplog.text
 
 
-def test_main_succeeds_with_valid_config(monkeypatch, caplog):
-    _set_env(monkeypatch)
+def test_main_runs_bot_with_valid_config(monkeypatch, caplog):
+    _set_env(monkeypatch, DISCORD_GUILD_ID="123")
     monkeypatch.chdir(Path(__file__).parent)
+    seen = {}
+
+    async def fake_run(settings):
+        seen["settings"] = settings
+
+    monkeypatch.setattr(entry, "run", fake_run)
     assert main() == 0
+    assert seen["settings"].discord_guild_id == 123
     assert "discord-secret" not in caplog.text
     assert "llm-secret" not in caplog.text
+
+
+def test_main_reports_rejected_token(monkeypatch, caplog):
+    _set_env(monkeypatch)
+    monkeypatch.chdir(Path(__file__).parent)
+
+    async def fake_run(settings):
+        raise discord.LoginFailure("bad token")
+
+    monkeypatch.setattr(entry, "run", fake_run)
+    assert main() == 1
+    assert "DISCORD_TOKEN" in caplog.text
+    assert "discord-secret" not in caplog.text

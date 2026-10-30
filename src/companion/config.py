@@ -20,6 +20,8 @@ class Settings(BaseSettings):
 
     # Discord
     discord_token: SecretStr
+    # If set, slash commands sync to this server instantly instead of globally.
+    discord_guild_id: int | None = None
 
     # LLM (any OpenAI-compatible endpoint)
     llm_base_url: str = "https://openrouter.ai/api/v1"

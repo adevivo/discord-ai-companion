@@ -2,14 +2,14 @@
 
 A private, self-hosted Discord bot that chats using any OpenAI-compatible LLM endpoint. It starts with [OpenRouter](https://openrouter.ai). The longer-term goal is a **Game Master mode**: the bot runs a shared, story-driven adventure for the people in a channel.
 
-> **Status:** Early development. Foundation modules (config, LLM client, message splitting) and the Docker stack are in place. The Discord connection is next. See [Roadmap](#roadmap).
+> **Status:** Chat MVP is code-complete and tested. Next step: a live test against a real Discord server. See [Roadmap](#roadmap).
 
 ## Roadmap
 
 | Phase | Scope | Status |
 |---|---|---|
 | 0 | Project scaffold, config, LLM client, message splitter, Docker stack | Done |
-| 1 | Chat MVP: Discord connection, `@mention` + `/ask`, SQLite context, rate limiting | Next |
+| 1 | Chat MVP: Discord connection, `@mention` + `/ask`, SQLite context, rate limiting | Built; awaiting live test |
 | 2 | Game Master mode | Designed, not started |
 | Later | Public-bot features (see [Future](#future-public-bot-considerations)) | Parked |
 
@@ -89,6 +89,7 @@ cp .env.example .env
 | Variable | Required | Default | Purpose |
 |---|---|---|---|
 | `DISCORD_TOKEN` | yes | | Bot token |
+| `DISCORD_GUILD_ID` | | | Server ID for instant slash-command sync. If unset, commands sync globally. |
 | `LLM_API_KEY` | yes | | API key for the LLM endpoint |
 | `LLM_MODEL` | yes | | Model ID, e.g. an OpenRouter model slug |
 | `LLM_BASE_URL` | | `https://openrouter.ai/api/v1` | Any OpenAI-compatible endpoint |
@@ -137,9 +138,13 @@ Layout:
 src/companion/
   config.py      # settings from env, validated, secrets masked
   llm.py         # OpenAI-compatible chat client + error mapping
+  store.py       # SQLite conversation context per channel/thread
+  ratelimit.py   # per-user sliding-window rate limiter
+  chat.py        # conversation logic (prompt building, errors), Discord-free
+  bot.py         # thin Discord adapter: @mention, /ask
   splitter.py    # split replies to Discord's 2000-char limit, code-block aware
   __main__.py    # entry point (python -m companion)
-tests/           # mirrors src; LLM tested via a fake HTTP transport
+tests/           # mirrors src; LLM and Discord are faked
 ```
 
 ## Phase 1: Chat MVP
@@ -158,7 +163,9 @@ tests/           # mirrors src; LLM tested via a fake HTTP transport
 - **Triggers:**
   - `@mention` replies in the same channel or thread.
   - `/ask <prompt>` defers the interaction (Discord requires an acknowledgment within 3 seconds), then posts the answer as a follow-up.
-- **Context:** a rolling window of recent messages per channel or thread, stored in SQLite so it survives restarts. SQLite is also the foundation for Game Master mode.
+- **Context:** a rolling window of **bot-directed messages only**, per channel or thread: prompts sent to the bot and its replies. Other channel chatter is never read, so the privileged Message Content intent isn't needed. Each prompt is stored with the speaker's display name so the bot can tell people apart. Context lives in SQLite and survives restarts. An exchange is only stored if the LLM answered.
+- **Server-only:** DMs are ignored and `/ask` is guild-only. This stops people outside the server from using up the API quota.
+- **Mention safety:** all bot messages are sent with mentions disabled, so LLM output can never ping `@everyone`, roles, or users.
 - **Output:** replies over 2000 characters are split at paragraph, line, or word boundaries. Code blocks are closed and reopened across chunks. No streaming, because repeatedly editing a message hits Discord rate limits.
 - **Limits and errors:** per-user rate limiting, and clear messages when the LLM is rate-limited, unavailable, or times out.
 - **Structured output:** JSON responses from the LLM are a first-class, tested component (parse, validate, retry), which Phase 2 depends on. We don't rely on native tool calling, since support is inconsistent across models.
@@ -211,13 +218,14 @@ Caveats with free models (check OpenRouter's current docs, since limits change):
 ## Open Questions
 
 **Chat MVP**
-- [ ] **Context contents:** include other users' channel messages, or only exchanges with the bot? Including others requires the privileged Message Content intent.
+- [x] **Context contents:** bot-directed messages only.
 - [ ] **Persona:** one fixed system prompt, or a configurable personality?
 - [ ] **Channels:** active everywhere, or only in an allowlist?
 
 **Game Master mode**
 - [ ] **Pacing:** live sessions, async over days, or both? This affects timeouts and nudges.
-- [ ] **Scope:** one game per channel, or one per thread? Leaning toward a thread per game.
+- [x] **Scope:** a game lives in its own sub-channel. `/game start` opens a Discord thread, and game state is keyed to that thread's ID. Game input uses slash commands (`/act`), so it's bot-directed and needs no extra intents.
+- [ ] **Free-form roleplay:** should the GM also read in-character chat in the game thread, beyond `/act`? That would require the Message Content intent.
 - [ ] **Characters:** quick player-made concept (name, one-line concept, a trait or two), or GM-generated?
 - [ ] **Premise:** do players pick genre and tone at start, or does the GM pitch options?
 - [ ] **Length:** one session (~2h), or several?

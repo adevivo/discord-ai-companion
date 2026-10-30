@@ -4,6 +4,7 @@ from companion.config import Settings
 
 _ENV_VARS = (
     "DISCORD_TOKEN",
+    "DISCORD_GUILD_ID",
     "LLM_BASE_URL",
     "LLM_API_KEY",
     "LLM_MODEL",
