@@ -251,3 +251,7 @@ These are parked until the private bot proves useful:
 - Usage quotas, paywall, and cost controls
 - Discord verification (required at 100+ servers) and approval for privileged intents
 - Market research: competing AI and GM bots, and demand among Discord users
+
+## License
+
+[MIT](LICENSE)
