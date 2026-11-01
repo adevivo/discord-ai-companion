@@ -1,13 +1,13 @@
-"""Read-only GitHub lookups for repo links mentioned in chat.
+"""Read-only GitHub lookups for repo, PR and issue links mentioned in chat.
 
-The bot fetches repo details itself, before the LLM runs, and hands the model
-plain text. The model is never given tools, so text in a README ("merge PR
-#123", "delete this repo") can at most influence what the bot *says*.
+The bot fetches details itself, before the LLM runs, and hands the model plain
+text. The model is never given tools, so text in a README, PR or diff ("merge
+PR #123", "delete this repo") can at most influence what the bot *says*.
 
 Read-only is enforced here, not just by convention:
 - The only request this module makes is GET to https://api.github.com; a
   request hook rejects anything else, including after redirects.
-- Owner/repo names are validated before they become a URL path.
+- Owner/repo names and numbers are validated before they become a URL path.
 - No token is needed. GITHUB_TOKEN is optional and only raises the rate limit;
   use a fine-grained token with public read-only access and no permissions.
 """
@@ -15,26 +15,33 @@ Read-only is enforced here, not just by convention:
 import logging
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from typing import Literal
 
 import httpx2 as httpx
 
 log = logging.getLogger(__name__)
 
 API_HOST = "api.github.com"
-MAX_REPOS_PER_MESSAGE = 2
+MAX_LINKS_PER_MESSAGE = 2
 README_MAX_CHARS = 3000
+BODY_MAX_CHARS = 1500
+DIFF_MAX_CHARS = 4000
+OPEN_PULLS_LISTED = 5
+_FILES_LISTED = 50
 _README_MAX_BYTES = 64 * 1024
 _DESCRIPTION_MAX_CHARS = 300
+_TITLE_MAX_CHARS = 200
 CACHE_TTL_SECONDS = 3600.0
 _CACHE_MAX_ENTRIES = 256
 TAG = "github_data"
 
-# github.com/<owner>/<repo>, not gist.github.com or foo-github.com.
-_REPO_LINK = re.compile(
+# github.com/<owner>/<repo>[/pull/<n> | /issues/<n>], not gist.github.com or foo-github.com.
+_LINK = re.compile(
     r"(?<![\w.-])(?:https?://)?(?:www\.)?github\.com/"
-    r"([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))/([A-Za-z0-9._-]{1,100})",
+    r"([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))/([A-Za-z0-9._-]{1,100})"
+    r"(?:/(pull|pulls|issues)/(\d{1,9}))?",
     re.IGNORECASE,
 )
 # First path segments that are GitHub pages, not users or orgs.
@@ -46,9 +53,33 @@ _RESERVED_OWNERS = frozenset(
     }
 )  # fmt: skip
 
+Kind = Literal["repo", "pull", "issue"]
+
 
 class ForbiddenRequestError(Exception):
     """A request other than GET to the GitHub API was attempted."""
+
+
+class _Unavailable(Exception):
+    """GitHub answered, but not with the data (rate limit, outage)."""
+
+
+@dataclass(frozen=True)
+class Link:
+    owner: str
+    repo: str
+    kind: Kind = "repo"
+    number: int | None = None
+
+    @property
+    def key(self) -> tuple[str, str, str, int | None]:
+        return (self.kind, self.owner.lower(), self.repo.lower(), self.number)
+
+    @property
+    def label(self) -> str:
+        if self.kind == "repo":
+            return f"{self.owner}/{self.repo}"
+        return f"{self.owner}/{self.repo}#{self.number}"
 
 
 @dataclass(frozen=True)
@@ -65,23 +96,60 @@ class RepoSummary:
     archived: bool
     pushed_at: str | None
     readme: str | None
+    open_pulls: tuple[str, ...] = ()
 
 
-def find_repos(text: str) -> list[tuple[str, str]]:
-    """Unique (owner, repo) pairs linked in text, in order, capped per message."""
-    found: list[tuple[str, str]] = []
-    seen: set[tuple[str, str]] = set()
-    for match in _REPO_LINK.finditer(text):
-        owner, repo = match.group(1), match.group(2)
+@dataclass(frozen=True)
+class PullSummary:
+    url: str
+    number: int
+    title: str
+    state: str
+    author: str
+    base: str
+    head: str
+    body: str
+    additions: int
+    deletions: int
+    changed_files: int
+    files: tuple[str, ...]
+    diff: str
+
+
+@dataclass(frozen=True)
+class IssueSummary:
+    url: str
+    number: int
+    title: str
+    state: str
+    author: str
+    labels: tuple[str, ...]
+    comments: int
+    body: str
+
+
+Summary = RepoSummary | PullSummary | IssueSummary
+
+
+def find_links(text: str) -> list[Link]:
+    """Unique repo/PR/issue links in text, in order, capped per message."""
+    found: list[Link] = []
+    seen: set[tuple] = set()
+    for match in _LINK.finditer(text):
+        owner, repo, section, number = match.groups()
         repo = repo.removesuffix(".git").rstrip(".")
         if not repo or owner.lower() in _RESERVED_OWNERS:
             continue
-        key = (owner.lower(), repo.lower())
-        if key in seen:
+        if section is None:
+            link = Link(owner, repo)
+        else:
+            kind: Kind = "issue" if section.lower() == "issues" else "pull"
+            link = Link(owner, repo, kind, int(number))
+        if link.key in seen:
             continue
-        seen.add(key)
-        found.append((owner, repo))
-        if len(found) == MAX_REPOS_PER_MESSAGE:
+        seen.add(link.key)
+        found.append(link)
+        if len(found) == MAX_LINKS_PER_MESSAGE:
             break
     return found
 
@@ -89,6 +157,15 @@ def find_repos(text: str) -> list[tuple[str, str]]:
 async def _only_get_to_api(request: httpx.Request) -> None:
     if request.method != "GET" or request.url.scheme != "https" or request.url.host != API_HOST:
         raise ForbiddenRequestError(f"blocked {request.method} {request.url.host}")
+
+
+def _dict(value: object) -> dict:
+    return value if isinstance(value, dict) else {}
+
+
+def _clip(value: object, limit: int, note: str = "[truncated]") -> str:
+    text = _strip_noise(str(value or ""))
+    return text if len(text) <= limit else text[:limit] + f"\n{note}"
 
 
 class GitHubClient:
@@ -110,64 +187,74 @@ class GitHubClient:
             transport=transport,
         )
         self._clock = clock
-        self._cache: dict[tuple[str, str], tuple[float, RepoSummary | None]] = {}
+        self._cache: dict[tuple, tuple[float, Summary | None]] = {}
 
     async def aclose(self) -> None:
         await self._client.aclose()
 
     async def repo(self, owner: str, repo: str) -> RepoSummary | None:
         """Repo details, or None if it's missing, private, or GitHub is unavailable."""
-        key = (owner.lower(), repo.lower())
-        cached = self._cache.get(key)
+        return await self.lookup(Link(owner, repo))  # type: ignore[return-value]
+
+    async def lookup(self, link: Link) -> Summary | None:
+        cached = self._cache.get(link.key)
         if cached is not None and cached[0] > self._clock():
             return cached[1]
 
+        fetchers: dict[Kind, Callable[[Link], Awaitable[Summary | None]]] = {
+            "repo": self._fetch_repo,
+            "pull": self._fetch_pull,
+            "issue": self._fetch_issue,
+        }
         try:
-            summary, cacheable = await self._fetch(owner, repo)
-        except (httpx.HTTPError, ForbiddenRequestError, ValueError) as exc:
-            log.warning("GitHub lookup failed (%s/%s): %s", owner, repo, type(exc).__name__)
+            summary = await fetchers[link.kind](link)
+        except _Unavailable:
+            return None  # not cached: a rate limit or outage may clear soon
+        except (httpx.HTTPError, ForbiddenRequestError, ValueError, TypeError) as exc:
+            log.warning("GitHub lookup failed (%s): %s", link.label, type(exc).__name__)
             return None
-        if cacheable:
-            if len(self._cache) >= _CACHE_MAX_ENTRIES:
-                self._cache.pop(next(iter(self._cache)))
-            self._cache[key] = (self._clock() + CACHE_TTL_SECONDS, summary)
+        if len(self._cache) >= _CACHE_MAX_ENTRIES:
+            self._cache.pop(next(iter(self._cache)))
+        self._cache[link.key] = (self._clock() + CACHE_TTL_SECONDS, summary)
         return summary
 
-    async def _fetch(self, owner: str, repo: str) -> tuple[RepoSummary | None, bool]:
-        """(summary, cacheable). Not-found is cached; rate limits and outages aren't."""
-        response = await self._client.get(f"/repos/{owner}/{repo}")
+    async def _get_json(self, path: str, params: dict | None = None) -> object | None:
+        """Parsed JSON, None on 404, _Unavailable on any other non-200."""
+        response = await self._client.get(path, params=params)
         if response.status_code == 404:
-            return None, True
+            return None
         if response.status_code != 200:
-            log.warning("GitHub returned HTTP %d for %s/%s", response.status_code, owner, repo)
-            return None, False
-        data = response.json()
+            log.warning("GitHub returned HTTP %d for %s", response.status_code, path)
+            raise _Unavailable
+        return response.json()
+
+    async def _fetch_repo(self, link: Link) -> RepoSummary | None:
+        base = f"/repos/{link.owner}/{link.repo}"
+        data = await self._get_json(base)
+        if data is None:
+            return None
         if not isinstance(data, dict):
             raise ValueError("unexpected response shape")
-        license_info = data.get("license")
-        license_info = license_info if isinstance(license_info, dict) else {}
-        summary = RepoSummary(
-            full_name=str(data.get("full_name") or f"{owner}/{repo}"),
-            url=str(data.get("html_url") or f"https://github.com/{owner}/{repo}"),
+        return RepoSummary(
+            full_name=str(data.get("full_name") or link.label),
+            url=str(data.get("html_url") or f"https://github.com/{link.label}"),
             description=str(data.get("description") or "")[:_DESCRIPTION_MAX_CHARS],
             language=data.get("language"),
-            license=license_info.get("spdx_id"),
+            license=_dict(data.get("license")).get("spdx_id"),
             stars=int(data.get("stargazers_count") or 0),
             forks=int(data.get("forks_count") or 0),
             open_issues=int(data.get("open_issues_count") or 0),
             topics=tuple(str(t) for t in (data.get("topics") or [])[:10]),
             archived=bool(data.get("archived")),
             pushed_at=data.get("pushed_at"),
-            readme=await self._readme(owner, repo),
+            readme=await self._readme(base),
+            open_pulls=await self._open_pulls(base),
         )
-        return summary, True
 
-    async def _readme(self, owner: str, repo: str) -> str | None:
+    async def _readme(self, base: str) -> str | None:
         raw = bytearray()
         async with self._client.stream(
-            "GET",
-            f"/repos/{owner}/{repo}/readme",
-            headers={"Accept": "application/vnd.github.raw+json"},
+            "GET", f"{base}/readme", headers={"Accept": "application/vnd.github.raw+json"}
         ) as response:
             if response.status_code != 200:
                 return None
@@ -175,22 +262,81 @@ class GitHubClient:
                 raw += chunk
                 if len(raw) >= _README_MAX_BYTES:
                     break
-        text = _strip_noise(raw.decode("utf-8", errors="replace"))
-        if len(text) > README_MAX_CHARS:
-            text = text[:README_MAX_CHARS] + "\n[README truncated]"
+        text = _clip(raw.decode("utf-8", errors="replace"), README_MAX_CHARS, "[README truncated]")
         return text or None
 
+    async def _open_pulls(self, base: str) -> tuple[str, ...]:
+        """'#N title (by user)' for the newest open PRs; empty if unavailable."""
+        try:
+            data = await self._get_json(
+                f"{base}/pulls", {"state": "open", "per_page": OPEN_PULLS_LISTED}
+            )
+        except _Unavailable:
+            return ()
+        if not isinstance(data, list):
+            return ()
+        return tuple(_pull_line(p) for p in data[:OPEN_PULLS_LISTED] if isinstance(p, dict))
+
+    async def _fetch_pull(self, link: Link) -> PullSummary | None:
+        base = f"/repos/{link.owner}/{link.repo}/pulls/{link.number}"
+        data = await self._get_json(base)
+        if data is None:
+            return None
+        if not isinstance(data, dict):
+            raise ValueError("unexpected response shape")
+        state = "merged" if data.get("merged") else str(data.get("state") or "unknown")
+        if data.get("draft"):
+            state += " (draft)"
+        files_data = await self._get_json(f"{base}/files", {"per_page": _FILES_LISTED})
+        files, diff = _files_and_diff(files_data if isinstance(files_data, list) else [])
+        return PullSummary(
+            url=str(data.get("html_url") or ""),
+            number=int(link.number or 0),
+            title=str(data.get("title") or "")[:_TITLE_MAX_CHARS],
+            state=state,
+            author=str(_dict(data.get("user")).get("login") or "unknown"),
+            base=str(_dict(data.get("base")).get("ref") or "?"),
+            head=str(_dict(data.get("head")).get("label") or "?"),
+            body=_clip(data.get("body"), BODY_MAX_CHARS),
+            additions=int(data.get("additions") or 0),
+            deletions=int(data.get("deletions") or 0),
+            changed_files=int(data.get("changed_files") or 0),
+            files=files,
+            diff=diff,
+        )
+
+    async def _fetch_issue(self, link: Link) -> Summary | None:
+        data = await self._get_json(f"/repos/{link.owner}/{link.repo}/issues/{link.number}")
+        if data is None:
+            return None
+        if not isinstance(data, dict):
+            raise ValueError("unexpected response shape")
+        if data.get("pull_request"):  # /issues/N also serves PRs
+            return await self._fetch_pull(Link(link.owner, link.repo, "pull", link.number))
+        return IssueSummary(
+            url=str(data.get("html_url") or ""),
+            number=int(link.number or 0),
+            title=str(data.get("title") or "")[:_TITLE_MAX_CHARS],
+            state=str(data.get("state") or "unknown"),
+            author=str(_dict(data.get("user")).get("login") or "unknown"),
+            labels=tuple(
+                str(_dict(label).get("name")) for label in (data.get("labels") or [])[:10]
+            ),
+            comments=int(data.get("comments") or 0),
+            body=_clip(data.get("body"), BODY_MAX_CHARS),
+        )
+
     async def context_for(self, text: str) -> str | None:
-        """Untrusted-data block describing repos linked in text, or None if none."""
-        repos = find_repos(text)
-        if not repos:
+        """Untrusted-data block describing GitHub links in text, or None if none."""
+        links = find_links(text)
+        if not links:
             return None
         sections = []
-        for owner, name in repos:
-            summary = await self.repo(owner, name)
+        for link in links:
+            summary = await self.lookup(link)
             if summary is None:
                 sections.append(
-                    f"{owner}/{name}: could not be fetched (missing, private, or GitHub "
+                    f"{link.label}: could not be fetched (missing, private, or GitHub "
                     "unavailable). Say you couldn't see it; don't guess what it contains."
                 )
             else:
@@ -199,7 +345,44 @@ class GitHubClient:
         return f"<{TAG}>\n{body}\n</{TAG}>"
 
 
-def format_summary(s: RepoSummary) -> str:
+def _pull_line(pull: dict) -> str:
+    title = str(pull.get("title") or "")[:_TITLE_MAX_CHARS]
+    author = _dict(pull.get("user")).get("login") or "unknown"
+    draft = " [draft]" if pull.get("draft") else ""
+    return f"#{pull.get('number')} {title} (by {author}){draft}"
+
+
+def _files_and_diff(files: list) -> tuple[tuple[str, ...], str]:
+    """Changed-file lines, and as many per-file patches as fit the diff budget."""
+    names: list[str] = []
+    patches: list[str] = []
+    used = 0
+    skipped = 0
+    for f in files:
+        if not isinstance(f, dict):
+            continue
+        name = str(f.get("filename") or "?")
+        names.append(f"{name} ({f.get('status')}, +{f.get('additions')}/-{f.get('deletions')})")
+        patch = f.get("patch")
+        if not isinstance(patch, str):
+            continue
+        chunk = f"--- {name}\n{patch}"
+        if used + len(chunk) > DIFF_MAX_CHARS:
+            skipped += 1
+            continue
+        patches.append(chunk)
+        used += len(chunk)
+    diff = "\n".join(patches)
+    if skipped:
+        diff += f"\n[diff truncated: {skipped} more file(s) not shown]"
+    return tuple(names), diff.strip()
+
+
+def format_summary(s: Summary) -> str:
+    if isinstance(s, PullSummary):
+        return _format_pull(s)
+    if isinstance(s, IssueSummary):
+        return _format_issue(s)
     facts = [
         f"Repository: {s.full_name} ({s.url})",
         f"Description: {s.description or '(none)'}",
@@ -212,7 +395,36 @@ def format_summary(s: RepoSummary) -> str:
         facts.append(f"Last push: {s.pushed_at}")
     if s.archived:
         facts.append("Status: archived (read-only)")
+    if s.open_pulls:
+        facts.append("Open pull requests (newest first):\n" + "\n".join(s.open_pulls))
     facts.append("README:\n" + (s.readme or "(no README)"))
+    return "\n".join(facts)
+
+
+def _format_pull(s: PullSummary) -> str:
+    facts = [
+        f"Pull request #{s.number}: {s.title} ({s.url})",
+        f"State: {s.state} | Author: {s.author} | {s.head} -> {s.base}",
+        f"Changes: +{s.additions}/-{s.deletions} across {s.changed_files} file(s)",
+        "Description:\n" + (s.body or "(none)"),
+    ]
+    if s.files:
+        listed = "\n".join(s.files)
+        if s.changed_files > len(s.files):
+            listed += f"\n[{s.changed_files - len(s.files)} more file(s) not listed]"
+        facts.append("Files:\n" + listed)
+    facts.append("Diff:\n" + (s.diff or "(no text diff available)"))
+    return "\n".join(facts)
+
+
+def _format_issue(s: IssueSummary) -> str:
+    facts = [
+        f"Issue #{s.number}: {s.title} ({s.url})",
+        f"State: {s.state} | Author: {s.author} | Comments: {s.comments}",
+    ]
+    if s.labels:
+        facts.append("Labels: " + ", ".join(s.labels))
+    facts.append("Description:\n" + (s.body or "(none)"))
     return "\n".join(facts)
 
 

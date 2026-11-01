@@ -192,7 +192,10 @@ tests/           # mirrors src; LLM and Discord are faked
 - **Mention safety:** all bot messages are sent with mentions disabled, so LLM output can never ping `@everyone`, roles, or users.
 - **Output:** replies over 2000 characters are split at paragraph, line, or word boundaries. Code blocks are closed and reopened across chunks. No streaming, because repeatedly editing a message hits Discord rate limits.
 - **Limits:** per-user and global rate limits. A rate-limited user is told once per window, and further messages in that window are silently ignored, so spam doesn't turn into bot spam.
-- **GitHub links:** when a bot-directed message links a GitHub repo (up to 2 per message), the bot fetches its public details and the start of its README, then gives them to the LLM for that turn only. History keeps just the user's message. This is **read-only by construction**:
+- **GitHub links:** when a bot-directed message links GitHub (up to 2 links per message), the bot fetches public details and gives them to the LLM for that turn only. History keeps just the user's message.
+  - Repo links: description, stats, the newest open PRs, and the start of the README.
+  - PR links (`/pull/N`): title, description, state, branches, changed files, and a diff excerpt capped at 4,000 characters.
+  - Issue links (`/issues/N`): title, description, state, labels, and comment count. This is **read-only by construction**:
   - The model has no tools. The bot does the fetching before the LLM runs, so a README that says "merge PR #123" can at most change what the bot *says*.
   - The GitHub client can only send `GET` to `https://api.github.com`. A request hook blocks any other method or host, including redirects.
   - Fetched text is wrapped in `<github_data>` tags, and the prompt marks it as untrusted. The text can't close that block early.
