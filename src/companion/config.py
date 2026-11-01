@@ -41,6 +41,11 @@ class Settings(BaseSettings):
     # Across all users: protects the provider account's quota.
     global_rate_limit_per_minute: int = Field(default=20, ge=1)
 
+    # GitHub repo lookups (read-only, public data). The token is optional and only
+    # raises GitHub's rate limit; give it no write permissions.
+    github_lookups: bool = True
+    github_token: SecretStr | None = None
+
     # Game Master mode
     game_round_hours: float = Field(default=24.0, gt=0)
     game_target_rounds: int = Field(default=12, ge=3)
@@ -48,7 +53,7 @@ class Settings(BaseSettings):
     # Storage
     database_path: Path = Path("data/companion.db")
 
-    @field_validator("discord_guild_id", "llm_max_tokens", mode="before")
+    @field_validator("discord_guild_id", "llm_max_tokens", "github_token", mode="before")
     @classmethod
     def _blank_is_unset(cls, value: object) -> object:
         # `DISCORD_GUILD_ID=` in .env means "not set", not "invalid integer".

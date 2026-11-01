@@ -24,6 +24,18 @@ def test_loads_from_environment_with_defaults(monkeypatch):
     assert s.llm_base_url == "https://openrouter.ai/api/v1"
     assert s.context_messages == 20
     assert s.database_path == Path("data/companion.db")
+    assert s.github_lookups is True
+    assert s.github_token is None
+
+
+def test_github_token_is_optional_and_masked(monkeypatch):
+    _set_env(monkeypatch, GITHUB_TOKEN="")
+    assert Settings(_env_file=None).github_token is None
+
+    _set_env(monkeypatch, GITHUB_TOKEN="gh-secret")
+    s = Settings(_env_file=None)
+    assert s.github_token.get_secret_value() == "gh-secret"
+    assert "gh-secret" not in repr(s) and "gh-secret" not in s.model_dump_json()
 
 
 @pytest.mark.parametrize("missing", sorted(REQUIRED))

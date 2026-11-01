@@ -7,6 +7,7 @@ license = "MIT"
 dependencies = [
     "aiosqlite>=0.22.1",
     "discord-py>=2.7.1",
+    "httpx2>=2.16.0",
     "openai>=3.41",
     "pydantic>=2.8",
     "pydantic-settings>=2.4",
@@ -14,7 +15,6 @@ dependencies = [
 
 [dependency-groups]
 dev = [
-    "httpx2>=2.16.0",
     "pytest>=8",
     "pytest-asyncio>=0.24",
     "ruff>=0.6",

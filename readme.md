@@ -177,7 +177,7 @@ tests/           # mirrors src; LLM and Discord are faked
 **Non-goals for now**
 - Being a public or verified bot, or billing.
 - Ambient participation, where the bot joins conversations without being addressed.
-- Long-term per-user memory, tool use or agent actions, and per-server configuration.
+- Long-term per-user memory, tool use or agent actions, and per-server configuration. (GitHub lookups are not tool use: the bot fetches repo details before the LLM runs.)
 
 **Scope**
 - **Triggers:**
@@ -192,6 +192,11 @@ tests/           # mirrors src; LLM and Discord are faked
 - **Mention safety:** all bot messages are sent with mentions disabled, so LLM output can never ping `@everyone`, roles, or users.
 - **Output:** replies over 2000 characters are split at paragraph, line, or word boundaries. Code blocks are closed and reopened across chunks. No streaming, because repeatedly editing a message hits Discord rate limits.
 - **Limits:** per-user and global rate limits. A rate-limited user is told once per window, and further messages in that window are silently ignored, so spam doesn't turn into bot spam.
+- **GitHub links:** when a bot-directed message links a GitHub repo (up to 2 per message), the bot fetches its public details and the start of its README, then gives them to the LLM for that turn only. History keeps just the user's message. This is **read-only by construction**:
+  - The model has no tools. The bot does the fetching before the LLM runs, so a README that says "merge PR #123" can at most change what the bot *says*.
+  - The GitHub client can only send `GET` to `https://api.github.com`. A request hook blocks any other method or host, including redirects.
+  - Fetched text is wrapped in `<github_data>` tags, and the prompt marks it as untrusted. The text can't close that block early.
+  - No token is needed (60 lookups/hour, cached for an hour). `GITHUB_TOKEN` is optional and only raises the limit. Use a fine-grained token with *Public repositories (read-only)* and no permissions. Set `GITHUB_LOOKUPS=false` to turn the feature off.
 - **Errors:** friendly messages when the LLM is rate-limited, unavailable, times out, or returns something malformed (e.g. a wrong `LLM_BASE_URL`). The provider's error text is logged to help diagnosis. If the user deleted their message while waiting, the answer is still posted.
 
 ## Phase 2: Game Master Mode

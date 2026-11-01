@@ -15,6 +15,7 @@ from companion.config import Settings
 from companion.db import connect
 from companion.game.engine import GameService
 from companion.game.store import GameStore
+from companion.github import GitHubClient
 from companion.llm import LLMClient
 from companion.ratelimit import RateLimiter
 from companion.store import ContextStore
@@ -26,6 +27,10 @@ async def run(settings: Settings) -> None:
     db = await connect(settings.database_path)
     store = ContextStore(db)
     llm = LLMClient(settings)
+    github = None
+    if settings.github_lookups:
+        token = settings.github_token
+        github = GitHubClient(token.get_secret_value() if token else None)
     try:
         chat = ChatService(
             llm=llm,
@@ -35,6 +40,7 @@ async def run(settings: Settings) -> None:
             system_prompt=settings.system_prompt,
             context_messages=settings.context_messages,
             context_max_chars=settings.context_max_chars,
+            github=github,
         )
         games = GameService(
             llm,
@@ -59,6 +65,8 @@ async def run(settings: Settings) -> None:
         async with bot:
             await bot.start(settings.discord_token.get_secret_value())
     finally:
+        if github is not None:
+            await github.aclose()
         await llm.aclose()
         await store.close()
 
