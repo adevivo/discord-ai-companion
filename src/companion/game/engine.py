@@ -9,8 +9,10 @@ never resolve the same round twice.
 import asyncio
 import logging
 import time
+import uuid
 from collections import defaultdict
 from collections.abc import Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 
 from companion.game import prompts
@@ -29,6 +31,8 @@ OVERTIME_ROUNDS = 2  # hard stop this many rounds past the target
 NOT_A_GAME = "There's no game in this thread. Start one with `/game new` in a regular channel."
 GAME_OVER = "This game has ended."
 GM_UNAVAILABLE = "The GM couldn't do that right now (AI provider problem). Try again in a minute."
+ALREADY_ACTED = "You already used `/act` this round."
+ACT_TOO_LONG = f"Keep the `/act` action to about {prompts.MAX_ACT_WORDS} words."
 
 
 @dataclass
@@ -72,6 +76,7 @@ class GameService:
         target_rounds: int = 12,
         clock: Callable[[], float] = time.time,
         roll: Callable[[], Roll] = roll_2d6,
+        owner_id: str | None = None,
     ) -> None:
         self._llm = llm
         self._store = store
@@ -80,6 +85,22 @@ class GameService:
         self._clock = clock
         self._roll = roll
         self._locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+        self._owner_id = owner_id or uuid.uuid4().hex
+
+    @asynccontextmanager
+    async def _game_lock(self, thread_id: str):
+        lock_name = f"game:{thread_id}"
+        async with self._locks[thread_id]:
+            acquired = await self._store.acquire_lock(
+                lock_name, self._owner_id, ttl=120.0, now=self._clock()
+            )
+            if not acquired:
+                yield False
+                return
+            try:
+                yield True
+            finally:
+                await self._store.release_lock(lock_name, self._owner_id)
 
     # --- setup ---------------------------------------------------------------------
 
@@ -224,6 +245,102 @@ class GameService:
                 await self._store.add_post(game.id, game.round_number, user_id, text)
         return True
 
+    async def is_ai_player(self, thread_id: str, user_id: str) -> bool:
+        game = await self._store.game_for_thread(thread_id)
+        if game is None:
+            return False
+        player = await self._store.player_for_game(game.id, user_id)
+        return bool(player and player.is_ai)
+
+    async def generate_ai_action(self, thread_id: str, user_id: str, persona: str) -> str | None:
+        game = await self._store.game_for_thread(thread_id)
+        if game is None or game.status is not Status.ACTIVE:
+            return None
+        player = await self._store.player_for_game(game.id, user_id)
+        if player is None or not player.is_ai:
+            return None
+        if user_id in await self._store.acted(game.id, game.round_number):
+            return None
+        messages = prompts.ai_action_messages(
+            game,
+            player,
+            persona,
+            await self._store.canon(game.id),
+            await self._store.last_narration(game.id),
+        )
+        try:
+            action = (await self._llm.complete(messages)).strip()
+        except LLMError as exc:
+            log.warning(
+                "AI player action failed (thread=%s, player=%s): %s", thread_id, user_id, exc
+            )
+            return None
+        words = action.split()
+        return " ".join(words[: prompts.MAX_ACT_WORDS]) or None
+
+    async def claim_event(self, event_id: str) -> bool:
+        return await self._store.claim_event(event_id)
+
+    async def invite_ai(
+        self, thread_id: str, user_id: str, display_name: str, concept: str = ""
+    ) -> Result:
+        """Add a mentioned Discord bot only after a human explicitly invites it."""
+        game = await self._store.game_for_thread(thread_id)
+        if game is None:
+            return Result(NOT_A_GAME)
+        if game.status is Status.ENDED:
+            return Result(GAME_OVER)
+
+        players = await self._store.players(game.id)
+        existing = next((p for p in players if p.user_id == user_id), None)
+        if existing is not None:
+            return Result(f"{display_name} is already in this adventure.")
+
+        if game.status in (Status.PITCHING, Status.LOBBY):
+            await self._store.add_player(
+                game.id, user_id, display_name, concept.strip(), 0, is_ai=True
+            )
+            return Result(
+                f"{display_name} was invited as an AI player.",
+                posts=[f"**{display_name}** was invited to the adventure by a human player."],
+            )
+
+        if game.status is not Status.ACTIVE:
+            return Result("There's no round in progress.")
+
+        async with self._game_lock(thread_id) as acquired:
+            if not acquired:
+                return Result("Another Bot instance is processing this game. Try again shortly.")
+            game = await self._store.get_game(game.id)
+            if game is None or game.status is not Status.ACTIVE:
+                return Result("There's no round in progress.")
+            players = await self._store.players(game.id)
+            if any(p.user_id == user_id for p in players):
+                return Result(f"{display_name} is already in this adventure.")
+            canon = await self._store.canon(game.id)
+            messages = prompts.character_messages(
+                game, display_name, concept.strip(), players, canon
+            )
+            try:
+                character = await complete_json(self._llm, messages, Character)
+            except LLMError as exc:
+                log.warning("AI player character failed (thread=%s): %s", thread_id, exc)
+                return Result(GM_UNAVAILABLE)
+            await self._store.add_player(
+                game.id, user_id, display_name, concept.strip(), game.round_number, is_ai=True
+            )
+            await self._store.set_character(game.id, user_id, character)
+            player = Player(
+                user_id, display_name, concept.strip(), character, game.round_number, is_ai=True
+            )
+            return Result(
+                f"{display_name} joined as an AI player.",
+                posts=[
+                    "A new AI player joins the story!\n" + character_card(player, character),
+                    round_open_post(game.round_number, game.round_deadline or self._clock()),
+                ],
+            )
+
     async def act(self, thread_id: str, user_id: str, note: str = "") -> Result:
         game = await self._store.game_for_thread(thread_id)
         if game is None:
@@ -231,17 +348,25 @@ class GameService:
         if game.status is not Status.ACTIVE:
             return Result("There's no round in progress.")
 
-        async with self._locks[thread_id]:
+        async with self._game_lock(thread_id) as acquired:
+            if not acquired:
+                return Result("Another Bot instance is processing this game. Try again shortly.")
             game = await self._store.get_game(game.id)
             players = await self._store.players(game.id)
             player = next((p for p in players if p.user_id == user_id), None)
             if player is None:
                 return Result("You're not in this game. Join with `/game join`.")
 
-            if note.strip():
-                await self._store.add_post(game.id, game.round_number, user_id, note.strip())
-            await self._store.mark_acted(game.id, game.round_number, user_id)
+            note = note.strip()
+            if len(note.split()) > prompts.MAX_ACT_WORDS:
+                return Result(ACT_TOO_LONG)
             acted = await self._store.acted(game.id, game.round_number)
+            if user_id in acted:
+                return Result(ALREADY_ACTED)
+            if note:
+                await self._store.add_post(game.id, game.round_number, user_id, note)
+            await self._store.mark_acted(game.id, game.round_number, user_id)
+            acted.add(user_id)
             ready = f"✅ **{player.label}** is ready ({len(acted)}/{len(players)})."
 
             if any(p.user_id not in acted for p in players):
@@ -270,7 +395,9 @@ class GameService:
             return None
 
         if now >= game.round_deadline:
-            async with self._locks[game.thread_id]:
+            async with self._game_lock(game.thread_id) as acquired:
+                if not acquired:
+                    return None
                 game = await self._store.get_game(game.id)
                 if game.status is not Status.ACTIVE or now < (game.round_deadline or now + 1):
                     return None  # resolved by a final /act while we waited
@@ -403,7 +530,9 @@ class GameService:
             return Result("Only the host (or a moderator) can end the game.")
         if game.status is Status.ENDED:
             return Result(GAME_OVER)
-        async with self._locks[thread_id]:
+        async with self._game_lock(thread_id) as acquired:
+            if not acquired:
+                return Result("Another Bot instance is processing this game. Try again shortly.")
             await self._store.update_game(game.id, status=Status.ENDED, round_deadline=None)
         return Result("Game ended.", posts=["🏁 The host has ended this adventure."])
 
@@ -412,7 +541,9 @@ class GameService:
         game = await self._store.game_for_thread(thread_id)
         if game is not None and game.status is not Status.ENDED:
             log.warning("Abandoning game whose thread is gone (thread=%s)", thread_id)
-            async with self._locks[thread_id]:
+            async with self._game_lock(thread_id) as acquired:
+                if not acquired:
+                    return
                 await self._store.update_game(game.id, status=Status.ENDED, round_deadline=None)
 
 

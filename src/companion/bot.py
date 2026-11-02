@@ -22,7 +22,12 @@ import discord
 from discord import app_commands
 
 from companion.chat import ChatService
-from companion.game.commands import deliver_due, handle_game_message, register_game_commands
+from companion.game.commands import (
+    deliver_due,
+    handle_ai_request,
+    handle_game_message,
+    register_game_commands,
+)
 from companion.game.engine import GameService
 from companion.splitter import split_message
 
@@ -174,7 +179,12 @@ async def handle_reset(chat: ChatService, interaction) -> None:
 
 class CompanionBot(discord.Client):
     def __init__(
-        self, chat: ChatService, guild_id: int | None = None, games: GameService | None = None
+        self,
+        chat: ChatService,
+        guild_id: int | None = None,
+        games: GameService | None = None,
+        game_events_enabled: bool = True,
+        ai_persona: str = "",
     ) -> None:
         intents = discord.Intents.default()
         # Needed to read in-character chat in game threads; ignored elsewhere.
@@ -182,6 +192,8 @@ class CompanionBot(discord.Client):
         super().__init__(intents=intents, allowed_mentions=NO_MENTIONS)
         self.chat = chat
         self.games = games
+        self.game_events_enabled = game_events_enabled
+        self.ai_persona = ai_persona
         self.guild_id = guild_id
         self.tree = app_commands.CommandTree(self)
         self._register_commands()
@@ -208,7 +220,7 @@ class CompanionBot(discord.Client):
             await handle_help(self.tree, interaction)
 
     async def setup_hook(self) -> None:
-        if self.games is not None:
+        if self.games is not None and self.game_events_enabled:
             self._deadline_task = asyncio.create_task(self._deadline_loop())
         try:
             if self.guild_id is not None:
@@ -235,6 +247,9 @@ class CompanionBot(discord.Client):
     async def on_message(self, message: discord.Message) -> None:
         if self.user is None:
             return
+        if self.games is not None:
+            if await handle_ai_request(self.games, message, self.user, self.ai_persona):
+                return
         # Game threads belong to the GM; chat mode doesn't answer there.
         if self.games is not None and await handle_game_message(self.games, message):
             return

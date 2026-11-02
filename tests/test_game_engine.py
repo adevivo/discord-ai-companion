@@ -246,6 +246,29 @@ async def test_in_character_chat_is_recorded_for_players_only(env):
     assert await store.posts(game.id, 1) == [("host", "Vex kicks the door.")]
 
 
+async def test_ai_can_be_invited_only_as_a_separate_player(env):
+    service, store, _, _ = env
+    await started_game(service)
+    result = await service.invite_ai("t", "bot1", "Story Bot")
+    assert "AI player" in result.message
+    players = await store.players((await store.game_for_thread("t")).id)
+    assert [(p.user_id, p.is_ai) for p in players] == [
+        ("host", False),
+        ("u2", False),
+        ("bot1", True),
+    ]
+
+
+async def test_act_is_once_per_round_and_limited(env):
+    service, _, _, _ = env
+    await started_game(service)
+    first = await service.act("t", "host", "one short action")
+    assert "1/2" in first.posts[0]
+    assert "already used" in (await service.act("t", "host", "again")).message
+    long_note = " ".join(["word"] * 51)
+    assert "50 words" in (await service.act("t", "u2", long_note)).message
+
+
 async def test_round_resolves_when_everyone_acts(env):
     service, store, llm, clock = env
     await started_game(service)

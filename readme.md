@@ -108,9 +108,81 @@ cp .env.example .env
 | `GLOBAL_RATE_LIMIT_PER_MINUTE` | | `20` | Limit across all users, to protect the provider account's quota |
 | `GAME_ROUND_HOURS` | | `24` | Round deadline in Game Master mode (reminder at the halfway point) |
 | `GAME_TARGET_ROUNDS` | | `12` | Target adventure length in rounds (hard stop 2 rounds later) |
-| `DATABASE_PATH` | | `data/companion.db` (`/data/companion.db` in Docker) | SQLite file location |
+| `DATABASE_PATH` | | `data/companion.db` (`/data/companion.db` in Docker) | Shared SQLite file location |
 
 Secrets are typed as `SecretStr`, so they're masked in logs and error output. If required values are missing, startup fails fast and names the missing variables, never their values.
+
+### Running on different terminals or devices
+
+Different terminals and devices can coordinate only when they use the **same shared database**.
+Set `DATABASE_PATH` to the same mounted network path on every machine, for example:
+
+```env
+DATABASE_PATH=\\server\discord-ai-companion\companion.db
+```
+
+Do not use separate local `data/companion.db` files: those files do not synchronize history,
+players, rounds, or AI identities. The application stores Discord message claims and short-lived
+game leases in the database, so multiple instances can safely receive the same Discord events
+without resolving a round twice. The shared storage must support concurrent writes; a local
+LAN/NAS mount is preferable to a high-latency or unreliable cross-region file share. For
+different regions, run one shared database service or a single shared data host rather than
+opening a SQLite file directly over the public internet.
+
+### Running multiple Discord Bots
+
+The same source tree can run up to ten independent Discord Bot applications. Each application
+needs its own Bot token; the token is not a Discord account name. Keep the existing unnumbered
+variables for the first Bot, then add numbered profiles for the second through tenth:
+
+```env
+DISCORD_TOKEN=first-bot-token
+DISCORD_GUILD_ID=first-server-id
+LLM_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai/
+LLM_API_KEY=first-gemini-key
+LLM_MODEL=gemini-2.5-flash
+
+DISCORD_TOKEN_2=second-bot-token
+DISCORD_GUILD_ID_2=second-server-id
+LLM_BASE_URL_2=https://generativelanguage.googleapis.com/v1beta/openai/
+LLM_API_KEY_2=second-gemini-key
+LLM_MODEL_2=gemini-2.5-pro
+```
+
+Add `_3` through `_10` in the same way when needed. `LLM_BASE_URL_N` is optional and falls back
+to the unnumbered URL. `DISCORD_GUILD_ID_N` is also optional and falls back to the unnumbered
+server ID. When more than one complete profile is configured, run:
+
+```powershell
+python -m companion
+```
+
+The terminal asks how many profiles to start. Enter an integer from `1` to the highest
+contiguous profile configured. All selected Bots run concurrently in this one terminal. All
+selected Bots register the same `/game` and `/act` commands and can create or host a game.
+The first Bot is the shared event coordinator: it consumes thread messages and runs deadline
+checks use a short shared database lease, while every Bot can execute game commands against the
+shared database. Event claims and game leases avoid duplicate messages and duplicate round
+resolution while keeping the command set equal, even when profiles run in separate terminals.
+
+### AI players in a shared adventure
+
+Every configured Bot has the same `/game`, `/act`, `/ask`, `/reset`, and `/help` commands.
+The first Bot is the GM/event coordinator; the other Bots can join as AI-controlled player
+characters. A human must explicitly invite a Bot in the game thread:
+
+```text
+@Evil 加入游戏 角色：盗贼，擅长潜行
+@Evil act
+```
+
+The invited Bot uses its numbered persona (and an optional requested `角色：...` or `role: ...`),
+generates one action of at most 50 words, and sends
+the controlled `/act ai ...` protocol message for the coordinator to resolve. AI messages do not
+invite themselves, trigger another AI, or start an automatic loop. The default personalities
+for profiles 1-10 are in [`src/companion/game/ai_roles.py`](src/companion/game/ai_roles.py);
+edit that file to customize each Bot's identity, personality, and behavior. Only a human
+message that explicitly mentions the target Bot can invite it or request its action.
 
 ### 3. Run
 
@@ -177,7 +249,7 @@ tests/           # mirrors src; LLM and Discord are faked
 **Non-goals for now**
 - Being a public or verified bot, or billing.
 - Ambient participation, where the bot joins conversations without being addressed.
-- Long-term per-user memory, tool use or agent actions, and per-server configuration. (GitHub lookups are not tool use: the bot fetches repo details before the LLM runs.)
+- Long-term per-user memory, tool use or agent actions, and per-server configuration.
 
 **Scope**
 - **Triggers:**
@@ -192,14 +264,6 @@ tests/           # mirrors src; LLM and Discord are faked
 - **Mention safety:** all bot messages are sent with mentions disabled, so LLM output can never ping `@everyone`, roles, or users.
 - **Output:** replies over 2000 characters are split at paragraph, line, or word boundaries. Code blocks are closed and reopened across chunks. No streaming, because repeatedly editing a message hits Discord rate limits.
 - **Limits:** per-user and global rate limits. A rate-limited user is told once per window, and further messages in that window are silently ignored, so spam doesn't turn into bot spam.
-- **GitHub links:** when a bot-directed message links GitHub (up to 2 links per message), the bot fetches public details and gives them to the LLM for that turn only. History keeps just the user's message.
-  - Repo links: description, stats, the newest open PRs, and the start of the README.
-  - PR links (`/pull/N`): title, description, state, branches, changed files, and a diff excerpt capped at 4,000 characters.
-  - Issue links (`/issues/N`): title, description, state, labels, and comment count. This is **read-only by construction**:
-  - The model has no tools. The bot does the fetching before the LLM runs, so a README that says "merge PR #123" can at most change what the bot *says*.
-  - The GitHub client can only send `GET` to `https://api.github.com`. A request hook blocks any other method or host, including redirects.
-  - Fetched text is wrapped in `<github_data>` tags, and the prompt marks it as untrusted. The text can't close that block early.
-  - No token is needed (60 lookups/hour, cached for an hour). `GITHUB_TOKEN` is optional and only raises the limit. Use a fine-grained token with *Public repositories (read-only)* and no permissions. Set `GITHUB_LOOKUPS=false` to turn the feature off.
 - **Errors:** friendly messages when the LLM is rate-limited, unavailable, times out, or returns something malformed (e.g. a wrong `LLM_BASE_URL`). The provider's error text is logged to help diagnosis. If the user deleted their message while waiting, the answer is still posted.
 
 ## Phase 2: Game Master Mode
@@ -237,6 +301,14 @@ Games are **asynchronous**, played over days in a dedicated thread.
 4. **Each round**, players post freely **in character** in the thread over the day. Messages starting with `((` or `//` are out-of-character and ignored. When a player is done, they use **`/act`** (optionally with a final note).
 5. The round **resolves** when every player has acted or the **24-hour deadline** passes. Players who didn't act follow the group's lead. At the halfway point, the bot pings only the players who haven't acted yet.
 6. The adventure targets **about 12 rounds**. The GM steers toward an ending, posts an epilogue, and the game closes.
+
+AI Discord bots can participate as players without creating a second game controller. A human
+must mention the bot in the game thread and explicitly say that it should join; ordinary bot
+messages are ignored until that invitation succeeds. Once invited, its messages are recorded as
+in-character posts. An AI player can submit one action per round by sending the text
+`/act ai <action>` (this is an internal message protocol, not a simulated Discord interaction);
+the action is limited to about 50 words. AI messages never automatically trigger another AI
+response, so the GM bot remains the only component that resolves rounds.
 
 Other commands: **`/game status`** (who's still to act, and the deadline), **`/game recap`** (story so far), **`/game canon`** (established facts), **`/game end`** (host or moderator).
 

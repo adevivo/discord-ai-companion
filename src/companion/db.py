@@ -47,6 +47,7 @@ CREATE TABLE IF NOT EXISTS players (
     concept        TEXT    NOT NULL DEFAULT '',
     character_json TEXT,
     joined_round   INTEGER NOT NULL DEFAULT 0,
+    is_ai          INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (game_id, user_id)
 );
 
@@ -84,6 +85,19 @@ CREATE TABLE IF NOT EXISTS narrations (
     round_number INTEGER NOT NULL,
     content      TEXT    NOT NULL
 );
+
+-- Cross-process coordination. This is effective when all instances use the
+-- same database file (for example a shared mounted volume).
+CREATE TABLE IF NOT EXISTS processed_events (
+    event_id   TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS coordination_locks (
+    lock_name  TEXT PRIMARY KEY,
+    owner_id   TEXT NOT NULL,
+    expires_at REAL NOT NULL
+);
 """
 
 
@@ -92,6 +106,13 @@ async def connect(path: Path | str) -> aiosqlite.Connection:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
     db = await aiosqlite.connect(path)
     await db.execute("PRAGMA foreign_keys = ON")
+    await db.execute("PRAGMA busy_timeout = 10000")
+    if str(path) != ":memory:":
+        await db.execute("PRAGMA journal_mode = WAL")
     await db.executescript(SCHEMA)
+    async with db.execute("PRAGMA table_info(players)") as cursor:
+        columns = {row[1] for row in await cursor.fetchall()}
+    if "is_ai" not in columns:
+        await db.execute("ALTER TABLE players ADD COLUMN is_ai INTEGER NOT NULL DEFAULT 0")
     await db.commit()
     return db

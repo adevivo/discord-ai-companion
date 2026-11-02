@@ -42,6 +42,7 @@ class Player:
     concept: str = ""
     character: Character | None = None
     joined_round: int = 0
+    is_ai: bool = False
 
     @property
     def label(self) -> str:
@@ -151,16 +152,24 @@ class GameStore:
     # --- players ---------------------------------------------------------------
 
     async def add_player(
-        self, game_id: int, user_id: str, display_name: str, concept: str, joined_round: int
+        self,
+        game_id: int,
+        user_id: str,
+        display_name: str,
+        concept: str,
+        joined_round: int,
+        *,
+        is_ai: bool = False,
     ) -> None:
         await self._db.execute(
             """
-            INSERT INTO players (game_id, user_id, display_name, concept, joined_round)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO players (game_id, user_id, display_name, concept, joined_round, is_ai)
+            VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT (game_id, user_id) DO UPDATE
-                SET display_name = excluded.display_name, concept = excluded.concept
+                SET display_name = excluded.display_name, concept = excluded.concept,
+                    is_ai = excluded.is_ai
             """,
-            (game_id, user_id, display_name, concept, joined_round),
+            (game_id, user_id, display_name, concept, joined_round, int(is_ai)),
         )
         await self._db.commit()
 
@@ -174,7 +183,7 @@ class GameStore:
     async def players(self, game_id: int) -> list[Player]:
         async with self._db.execute(
             """
-            SELECT user_id, display_name, concept, character_json, joined_round
+            SELECT user_id, display_name, concept, character_json, joined_round, is_ai
             FROM players WHERE game_id = ? ORDER BY rowid
             """,
             (game_id,),
@@ -187,9 +196,14 @@ class GameStore:
                 concept=row[2],
                 character=Character.model_validate_json(row[3]) if row[3] else None,
                 joined_round=row[4],
+                is_ai=bool(row[5]),
             )
             for row in rows
         ]
+
+    async def player_for_game(self, game_id: int, user_id: str) -> Player | None:
+        players = await self.players(game_id)
+        return next((player for player in players if player.user_id == user_id), None)
 
     # --- rounds ------------------------------------------------------------------
 
@@ -259,3 +273,34 @@ class GameStore:
         ) as cursor:
             row = await cursor.fetchone()
         return row[0] if row else ""
+
+    async def claim_event(self, event_id: str) -> bool:
+        """Claim a Discord event once across all instances sharing this DB."""
+        cursor = await self._db.execute(
+            "INSERT OR IGNORE INTO processed_events (event_id) VALUES (?)", (event_id,)
+        )
+        await self._db.commit()
+        return cursor.rowcount == 1
+
+    async def acquire_lock(self, lock_name: str, owner_id: str, ttl: float, now: float) -> bool:
+        """Acquire or renew a short database-backed lease."""
+        cursor = await self._db.execute(
+            """
+            INSERT INTO coordination_locks (lock_name, owner_id, expires_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(lock_name) DO UPDATE SET
+                owner_id = excluded.owner_id,
+                expires_at = excluded.expires_at
+            WHERE coordination_locks.expires_at <= ? OR coordination_locks.owner_id = ?
+            """,
+            (lock_name, owner_id, now + ttl, now, owner_id),
+        )
+        await self._db.commit()
+        return cursor.rowcount == 1
+
+    async def release_lock(self, lock_name: str, owner_id: str) -> None:
+        await self._db.execute(
+            "DELETE FROM coordination_locks WHERE lock_name = ? AND owner_id = ?",
+            (lock_name, owner_id),
+        )
+        await self._db.commit()

@@ -12,6 +12,7 @@ from companion.game.commands import (
     NEEDS_TEXT_CHANNEL,
     THREAD_FAILED,
     deliver_due,
+    handle_ai_request,
     handle_game_message,
     handle_new_game,
     run_command,
@@ -43,6 +44,17 @@ class FakeGames:
     async def abandon(self, thread_id):
         self.abandoned.append(thread_id)
 
+    async def invite_ai(self, thread_id, user_id, display_name, concept):
+        self.invited = (thread_id, user_id, display_name, concept)
+        return Result("invited", posts=["AI joined"])
+
+    async def is_ai_player(self, thread_id, user_id):
+        return getattr(self, "ai_player", False)
+
+    async def generate_ai_action(self, thread_id, user_id, persona):
+        self.generated = (thread_id, user_id, persona)
+        return "I open the sealed door."
+
 
 def make_interaction(channel=None):
     return SimpleNamespace(
@@ -63,11 +75,16 @@ def make_message(channel_parent=123, **overrides):
         webhook_id=None,
         guild=SimpleNamespace(id=7),
         type=discord.MessageType.default,
-        channel=SimpleNamespace(id=500, parent_id=channel_parent),
+        channel=SimpleNamespace(id=500, parent_id=channel_parent, send=AsyncMock()),
         content="Vex kicks the door.",
+        mentions=[],
     )
     values.update(overrides)
     return SimpleNamespace(**values)
+
+
+def make_user(user_id, display_name, *, bot=False):
+    return SimpleNamespace(id=user_id, display_name=display_name, name=display_name, bot=bot)
 
 
 # --- send_result -------------------------------------------------------------------
@@ -163,6 +180,58 @@ async def test_thread_chat_goes_to_engine():
     games = FakeGames()
     assert await handle_game_message(games, make_message()) is True
     assert games.observed == [("500", "1", "Vex kicks the door.")]
+
+
+async def test_unregistered_bot_is_ignored():
+    games = FakeGames()
+    message = make_message(author=SimpleNamespace(id=2, bot=True))
+    assert await handle_game_message(games, message) is False
+    assert games.observed == []
+
+
+async def test_registered_ai_can_submit_controlled_act_message():
+    games = FakeGames()
+    games.is_ai_player = AsyncMock(return_value=True)
+    games.act = AsyncMock(return_value=Result("accepted", posts=["✅ AI is ready."]))
+    channel = SimpleNamespace(id=500, parent_id=123, send=AsyncMock())
+    message = make_message(
+        author=SimpleNamespace(id=2, bot=True),
+        channel=channel,
+        content="/act ai I search the room.",
+    )
+    assert await handle_game_message(games, message) is True
+    games.act.assert_awaited_once_with("500", "2", "I search the room.")
+    channel.send.assert_awaited_once()
+
+
+async def test_human_invites_target_ai_with_its_persona():
+    games = FakeGames()
+    bot = make_user(2, "Evil", bot=True)
+    message = make_message(
+        author=make_user(1, "Sam"),
+        mentions=[bot],
+        content="@Evil join this game role: scout",
+    )
+    assert await handle_ai_request(games, message, bot, "Identity: saboteur") is True
+    assert games.invited == (
+        "500",
+        "2",
+        "Evil",
+        "Identity: saboteur\nPlayer-requested role: scout",
+    )
+
+
+async def test_human_requests_ai_act_and_ai_posts_controlled_protocol():
+    games = FakeGames()
+    games.ai_player = True
+    bot = make_user(2, "Evil", bot=True)
+    message = make_message(
+        author=make_user(1, "Sam"),
+        mentions=[bot],
+        content="@Evil act",
+    )
+    assert await handle_ai_request(games, message, bot, "Identity: saboteur") is True
+    assert message.channel.send.call_args.args == ("/act ai I open the sealed door.",)
 
 
 @pytest.mark.parametrize(

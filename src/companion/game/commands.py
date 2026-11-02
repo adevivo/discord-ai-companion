@@ -8,6 +8,7 @@ the specific players the engine lists (never anything from LLM output).
 
 import contextlib
 import logging
+import re
 from collections.abc import Awaitable, Callable
 
 import discord
@@ -27,6 +28,19 @@ THREAD_FAILED = (
 THREAD_NAME_PREFIX = "🏮 "
 ONE_WEEK_MINUTES = 10080
 _USER_MESSAGE_TYPES = (discord.MessageType.default, discord.MessageType.reply)
+_AI_ACT = re.compile(r"^/act(?:\s+ai)?\s+(.+)$", re.IGNORECASE | re.DOTALL)
+_AI_JOIN_WORDS = ("join", "enter", "加入", "进入", "参加", "进来")
+_AI_ROLE = re.compile(r"(?:身份|角色|role)\s*[:：=]\s*(.+)", re.IGNORECASE)
+
+
+def _requests_ai_join(content: str) -> bool:
+    lowered = content.casefold()
+    return any(word in lowered for word in _AI_JOIN_WORDS)
+
+
+def _requested_ai_role(content: str) -> str | None:
+    match = _AI_ROLE.search(content)
+    return match.group(1).strip() if match else None
 
 
 async def send_result(channel, result: Result) -> None:
@@ -101,16 +115,74 @@ async def handle_new_game(games: GameService, interaction, genre: str) -> None:
 async def handle_game_message(games: GameService, message) -> bool:
     """Feed in-character chat to the engine. True if the message was in a game thread."""
     if (
-        message.author.bot
-        or message.webhook_id is not None
+        message.webhook_id is not None
         or message.guild is None
         or message.type not in _USER_MESSAGE_TYPES
         or getattr(message.channel, "parent_id", None) is None  # only threads host games
     ):
         return False
-    return await games.observe_message(
-        str(message.channel.id), str(message.author.id), message.content
+    thread_id = str(message.channel.id)
+    event_id = getattr(message, "id", None)
+    if event_id is not None and hasattr(games, "claim_event"):
+        if not await games.claim_event(f"message:{event_id}"):
+            return True
+    user_id = str(message.author.id)
+    is_ai = (
+        await games.is_ai_player(thread_id, user_id)
+        if hasattr(games, "is_ai_player")
+        else False
     )
+    if message.author.bot and not is_ai:
+        return False
+
+    if is_ai:
+        match = _AI_ACT.match(message.content.strip())
+        if match:
+            result = await games.act(thread_id, user_id, match.group(1))
+            await send_result(message.channel, result)
+            return True
+
+    return await games.observe_message(
+        thread_id, user_id, message.content
+    )
+
+
+async def handle_ai_request(games: GameService, message, bot_user, persona: str) -> bool:
+    """Let a human explicitly invite or request an action from this AI Bot."""
+    if (
+        message.author.bot
+        or message.webhook_id is not None
+        or message.guild is None
+        or message.type not in _USER_MESSAGE_TYPES
+        or getattr(message.channel, "parent_id", None) is None
+        or not any(user.id == bot_user.id for user in getattr(message, "mentions", ()))
+    ):
+        return False
+    content = message.content.casefold()
+    thread_id = str(message.channel.id)
+    if _requests_ai_join(content):
+        requested_role = _requested_ai_role(message.content)
+        concept = (
+            f"{persona}\nPlayer-requested role: {requested_role}"
+            if requested_role
+            else persona
+        )
+        result = await games.invite_ai(thread_id, str(bot_user.id), bot_user.display_name, concept)
+        await send_result(message.channel, result)
+        return True
+    if "act" not in content:
+        return False
+    if not await games.is_ai_player(thread_id, str(bot_user.id)):
+        return True
+    action = await games.generate_ai_action(thread_id, str(bot_user.id), persona)
+    if action:
+        await message.channel.send(f"/act ai {action}", allowed_mentions=NO_MENTIONS)
+    else:
+        await message.channel.send(
+            "I cannot act right now, or I already acted this round.",
+            allowed_mentions=NO_MENTIONS,
+        )
+    return True
 
 
 async def deliver_due(games: GameService, get_channel: Callable[[int], Awaitable]) -> None:
@@ -154,6 +226,13 @@ def register_game_commands(tree: app_commands.CommandTree, games: GameService) -
     @game.command(name="join", description="Join the adventure in this thread")
     @app_commands.describe(concept="Optional idea for your character, e.g. 'ex-cop with debts'")
     async def join(interaction: discord.Interaction, concept: str = "") -> None:
+        if interaction.user.bot:
+            await interaction.response.send_message(
+                "Only human players can join with `/game join`.",
+                ephemeral=True,
+                allowed_mentions=NO_MENTIONS,
+            )
+            return
         await run_command(
             interaction,
             lambda: games.join(

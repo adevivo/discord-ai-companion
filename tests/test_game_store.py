@@ -64,6 +64,19 @@ async def test_active_games(store):
     assert [g.id for g in await store.active_games()] == [a.id, c.id]
 
 
+async def test_events_are_claimed_once(store):
+    assert await store.claim_event("message:123") is True
+    assert await store.claim_event("message:123") is False
+
+
+async def test_coordination_lock_is_exclusive_and_expires(store):
+    assert await store.acquire_lock("game:t1", "bot-a", 30, now=100) is True
+    assert await store.acquire_lock("game:t1", "bot-b", 30, now=110) is False
+    assert await store.acquire_lock("game:t1", "bot-b", 30, now=131) is True
+    await store.release_lock("game:t1", "bot-b")
+    assert await store.acquire_lock("game:t1", "bot-a", 30, now=131) is True
+
+
 async def test_players_join_rejoin_and_characters(store):
     game = await new_game(store)
     await store.add_player(game.id, "u1", "Sam", "ex-cop", 0)
@@ -80,6 +93,13 @@ async def test_players_join_rejoin_and_characters(store):
     assert players[0].character == char
     assert players[0].label == "Sammy (Vex)"
     assert players[1].character is None and players[1].label == "Ann"
+
+
+async def test_ai_player_flag_is_persisted(store):
+    game = await new_game(store)
+    await store.add_player(game.id, "bot1", "Story Bot", "", 0, is_ai=True)
+    player = (await store.players(game.id))[0]
+    assert player.is_ai is True
 
 
 async def test_posts_and_actions_are_per_round(store):
