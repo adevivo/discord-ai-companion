@@ -41,15 +41,36 @@ class PlayerCharacter(Character):
     player: str = Field(min_length=1, description="The player's display name")
 
 
+def _clamp_act(value: int) -> int:
+    return min(max(value, 1), 4)
+
+
 class OutlineNpc(BaseModel):
     name: str
+    wants: str = ""
     secret: str = ""
+
+
+class Mystery(BaseModel):
+    """A planned unknown. The answer is decided up front so the story can pay it off."""
+
+    question: str = Field(min_length=1)
+    answer: str = Field(min_length=1)
+    reveal_act: int = 2
+
+    @field_validator("reveal_act", mode="after")
+    @classmethod
+    def _clamp(cls, value: int) -> int:
+        return _clamp_act(value)
 
 
 class Outline(BaseModel):
     premise: str = Field(min_length=1)
+    goal: str = Field(min_length=1, description="What the characters are trying to achieve")
+    opposition: str = Field(default="", description="Who or what stands in the way, and why")
     acts: list[str] = Field(min_length=3, max_length=4)
     npcs: list[OutlineNpc] = Field(default_factory=list)
+    mysteries: list[Mystery] = Field(default_factory=list, max_length=2)
     endings: list[str] = Field(default_factory=list)
 
 
@@ -72,4 +93,4 @@ class RoundResult(BaseModel):
     @field_validator("act", mode="after")
     @classmethod
     def _clamp_act(cls, value: int) -> int:
-        return min(max(value, 1), 4)
+        return _clamp_act(value)

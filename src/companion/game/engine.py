@@ -8,21 +8,32 @@ never resolve the same round twice.
 
 import asyncio
 import logging
+import re
 import time
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
+from pydantic import BaseModel
+
 from companion.game import prompts
 from companion.game.dice import Roll, roll_2d6
 from companion.game.schemas import Character, Pitches, PlayerCharacter, RoundResult, Setup
 from companion.game.store import Game, GameStore, Player, Status
-from companion.llm import LLMClient, LLMError
+from companion.llm import ChatMessage, LLMClient, LLMError
 from companion.structured import complete_json
 
 log = logging.getLogger(__name__)
 
-OOC_PREFIXES = ("((", "//")
+# Out-of-character messages stay out of the story: "((", "//", or "ooc" at the start,
+# optionally bracketed, e.g. "ooc: brb", "(ooc) nice roll", "[OOC] lol".
+_OOC = re.compile(r"^(?:\(\(|//|[\(\[]?\s*ooc\b)", re.IGNORECASE)
+
+
+def is_ooc(text: str) -> bool:
+    return bool(_OOC.match(text))
+
+
 RETRY_SECONDS = 600
 OVERTIME_ROUNDS = 2  # hard stop this many rounds past the target
 
@@ -51,7 +62,7 @@ def lobby_post(genre: str) -> str:
         "Join with `/game join` (optionally describe a character concept). "
         "When everyone's in, the host starts it with `/game begin`.\n"
         "-# Everything posted in this thread during the game is sent to the AI provider. "
-        "Start a message with `((` or `//` to keep it out of the story."
+        "Start a message with `ooc`, `((` or `//` to keep it out of the story."
     )
 
 
@@ -70,6 +81,7 @@ class GameService:
         *,
         round_hours: float = 24.0,
         target_rounds: int = 12,
+        temperature: float | None = 0.7,
         clock: Callable[[], float] = time.time,
         roll: Callable[[], Roll] = roll_2d6,
     ) -> None:
@@ -77,9 +89,13 @@ class GameService:
         self._store = store
         self._round_seconds = round_hours * 3600
         self._target_rounds = target_rounds
+        self._temperature = temperature
         self._clock = clock
         self._roll = roll
         self._locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+
+    async def _ask[T: BaseModel](self, messages: list[ChatMessage], model: type[T]) -> T:
+        return await complete_json(self._llm, messages, model, temperature=self._temperature)
 
     # --- setup ---------------------------------------------------------------------
 
@@ -90,7 +106,7 @@ class GameService:
             return Result("Game created.", posts=[lobby_post(genre)])
 
         try:
-            pitches = await complete_json(self._llm, prompts.pitch_messages(), Pitches)
+            pitches = await self._ask(prompts.pitch_messages(), Pitches)
         except LLMError as exc:
             log.warning("Pitch generation failed (thread=%s): %s", thread_id, exc)
             await self._store.create_game(guild_id, thread_id, host_id, Status.LOBBY)
@@ -148,7 +164,7 @@ class GameService:
             canon = await self._store.canon(game.id)
             messages = prompts.character_messages(game, display_name, concept, players, canon)
             try:
-                character = await complete_json(self._llm, messages, Character)
+                character = await self._ask(messages, Character)
             except LLMError as exc:
                 log.warning("Late-join character failed (thread=%s): %s", thread_id, exc)
                 return Result(GM_UNAVAILABLE)
@@ -179,7 +195,7 @@ class GameService:
 
             messages = prompts.setup_messages(game.genre, players, self._target_rounds)
             try:
-                setup = await complete_json(self._llm, messages, Setup)
+                setup = await self._ask(messages, Setup)
             except LLMError as exc:
                 log.warning("Game setup failed (thread=%s): %s", thread_id, exc)
                 return Result(GM_UNAVAILABLE)
@@ -218,7 +234,7 @@ class GameService:
         if game is None:
             return False
         text = content.strip()
-        if game.status is Status.ACTIVE and text and not text.startswith(OOC_PREFIXES):
+        if game.status is Status.ACTIVE and text and not is_ooc(text):
             players = await self._store.players(game.id)
             if any(p.user_id == user_id for p in players):
                 await self._store.add_post(game.id, game.round_number, user_id, text)
@@ -304,7 +320,7 @@ class GameService:
             self._target_rounds,
         )
         try:
-            result = await complete_json(self._llm, messages, RoundResult)
+            result = await self._ask(messages, RoundResult)
         except LLMError as exc:
             failures = game.resolve_failures + 1
             log.error(

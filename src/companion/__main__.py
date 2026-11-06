@@ -47,6 +47,7 @@ async def run(settings: Settings) -> None:
             GameStore(db),
             round_hours=settings.game_round_hours,
             target_rounds=settings.game_target_rounds,
+            temperature=settings.game_temperature,
         )
         bot = CompanionBot(chat, guild_id=settings.discord_guild_id, games=games)
 

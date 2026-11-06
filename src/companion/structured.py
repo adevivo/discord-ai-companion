@@ -30,12 +30,16 @@ def parse_json_reply[T: BaseModel](text: str, model: type[T]) -> T:
 
 
 async def complete_json[T: BaseModel](
-    llm: LLMClient, messages: list[ChatMessage], model: type[T], attempts: int = 3
+    llm: LLMClient,
+    messages: list[ChatMessage],
+    model: type[T],
+    attempts: int = 3,
+    temperature: float | None = None,
 ) -> T:
     """Ask the LLM for JSON matching `model`, retrying with feedback on invalid output."""
     conversation = list(messages)
     for attempt in range(1, attempts + 1):
-        reply = await llm.complete(conversation)
+        reply = await llm.complete(conversation, temperature=temperature)
         try:
             return parse_json_reply(reply, model)
         except (ValueError, ValidationError) as exc:  # ValidationError is a ValueError

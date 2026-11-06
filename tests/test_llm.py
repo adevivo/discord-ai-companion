@@ -187,3 +187,25 @@ async def test_aclose_closes_sdk_client(settings):
     client = _client(settings, lambda r: httpx.Response(200, json=_completion("hi")))
     await client.aclose()
     assert client._client.is_closed()
+
+
+async def test_temperature_omitted_by_default(settings):
+    seen = {}
+
+    def handler(request):
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json=_completion("hi"))
+
+    await _client(settings, handler).complete(MESSAGES)
+    assert "temperature" not in seen["body"]
+
+
+async def test_temperature_sent_when_given(settings):
+    seen = {}
+
+    def handler(request):
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json=_completion("hi"))
+
+    await _client(settings, handler).complete(MESSAGES, temperature=0.7)
+    assert seen["body"]["temperature"] == 0.7

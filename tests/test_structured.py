@@ -1,7 +1,7 @@
 import pytest
 from pydantic import BaseModel
 
-from companion.game.schemas import CanonEntry, Pitches, RoundResult
+from companion.game.schemas import CanonEntry, Outline, Pitches, RoundResult
 from companion.llm import ChatMessage, LLMError
 from companion.structured import complete_json, parse_json_reply
 
@@ -15,9 +15,11 @@ class ScriptedLLM:
     def __init__(self, *replies: str) -> None:
         self.replies = list(replies)
         self.calls: list[list[ChatMessage]] = []
+        self.temperatures: list[float | None] = []
 
-    async def complete(self, messages):
+    async def complete(self, messages, temperature=None):
         self.calls.append(messages)
+        self.temperatures.append(temperature)
         return self.replies.pop(0)
 
 
@@ -90,3 +92,31 @@ def test_round_result_act_is_clamped_and_defaults_apply():
 def test_pitches_require_exactly_three():
     with pytest.raises(ValueError):
         Pitches.model_validate({"pitches": [{"title": "a", "hook": "b"}]})
+
+
+async def test_complete_json_passes_temperature_on_every_attempt():
+    llm = ScriptedLLM("nope", '{"name": "a", "count": 1}')
+    await complete_json(llm, PROMPT, Thing, temperature=0.5)
+    assert llm.temperatures == [0.5, 0.5]
+
+
+OUTLINE = {"premise": "p", "goal": "find the gem", "acts": ["a", "b", "c"]}
+
+
+def test_outline_requires_a_goal():
+    with pytest.raises(ValueError):
+        Outline.model_validate({**OUTLINE, "goal": ""})
+    with pytest.raises(ValueError):
+        Outline.model_validate({k: v for k, v in OUTLINE.items() if k != "goal"})
+
+
+def test_outline_mysteries_need_answers_and_are_capped():
+    mystery = {"question": "Who rings the bell?", "answer": "The miner's ghost", "reveal_act": 9}
+    outline = Outline.model_validate({**OUTLINE, "mysteries": [mystery]})
+    assert outline.mysteries[0].reveal_act == 4  # clamped
+    assert outline.opposition == "" and outline.npcs == []
+
+    with pytest.raises(ValueError):
+        Outline.model_validate({**OUTLINE, "mysteries": [{"question": "Why?", "answer": ""}]})
+    with pytest.raises(ValueError):
+        Outline.model_validate({**OUTLINE, "mysteries": [mystery] * 3})

@@ -49,6 +49,8 @@ class Settings(BaseSettings):
     # Game Master mode
     game_round_hours: float = Field(default=24.0, gt=0)
     game_target_rounds: int = Field(default=12, ge=3)
+    # Lower than most providers' default (1.0) to keep stories coherent.
+    game_temperature: float = Field(default=0.7, ge=0, le=2)
 
     # Storage
     database_path: Path = Path("data/companion.db")

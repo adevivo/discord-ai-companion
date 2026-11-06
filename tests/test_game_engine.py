@@ -21,8 +21,13 @@ SETUP = {
     "title": "Neon Rain",
     "outline": {
         "premise": "The city's AI is dreaming.",
+        "goal": "Find the AI's core and wake it before the grid fails.",
+        "opposition": "A corporation profiting from the outages.",
         "acts": ["Strange glitches", "The source", "Wake the city"],
-        "npcs": [{"name": "Mara", "secret": "She is the AI's avatar."}],
+        "npcs": [{"name": "Mara", "wants": "To be free", "secret": "She is the AI's avatar."}],
+        "mysteries": [
+            {"question": "Why do the lights stutter?", "answer": "The AI dreams.", "reveal_act": 2}
+        ],
         "endings": ["The city wakes", "The dream consumes all"],
     },
     "characters": [
@@ -57,12 +62,16 @@ class GMFake:
 
     def __init__(self):
         self.calls = []
+        self.systems = []
+        self.temperatures = []
         self.round_replies = []
         self.fail = set()
 
-    async def complete(self, messages):
+    async def complete(self, messages, temperature=None):
         prompt = messages[-1].content
         self.calls.append(prompt)
+        self.systems.append(messages[0].content)
+        self.temperatures.append(temperature)
         kind = (
             "pitch"
             if "Pitch three" in prompt
@@ -242,8 +251,14 @@ async def test_in_character_chat_is_recorded_for_players_only(env):
     assert await service.observe_message("t", "host", "Vex kicks the door.") is True
     assert await service.observe_message("t", "host", "(( brb, dinner ))") is True
     assert await service.observe_message("t", "host", "// out of character") is True
+    for ooc in ("ooc: nice roll", "OOC lol", "(ooc) back soon", "[OOC] gtg", "  ooc - hi"):
+        assert await service.observe_message("t", "host", ooc) is True
+    assert await service.observe_message("t", "host", "Vex mutters about the cooc.") is True
     assert await service.observe_message("t", "stranger", "I'm not playing") is True
-    assert await store.posts(game.id, 1) == [("host", "Vex kicks the door.")]
+    assert await store.posts(game.id, 1) == [
+        ("host", "Vex kicks the door."),
+        ("host", "Vex mutters about the cooc."),
+    ]
 
 
 async def test_round_resolves_when_everyone_acts(env):
@@ -320,6 +335,7 @@ async def test_final_round_prompt_and_hard_stop(env):
     await service.act("t", "host")
     await service.act("t", "u2")
     assert "This is the final round" in llm.calls[-1]
+    assert "no new lore" in llm.calls[-1]
 
     await store.update_game(game.id, round_number=14)  # model ignored the ending twice
     await service.act("t", "host")
@@ -460,3 +476,67 @@ async def test_abandon_stops_a_game_whose_thread_is_gone(env):
     assert await service.tick() == []
     assert len(llm.calls) == calls  # no more LLM spend
     await service.abandon("missing")  # unknown threads are ignored
+
+
+# --- story grounding ---------------------------------------------------------------------
+
+
+async def test_gm_calls_use_configured_temperature(env):
+    service, _, llm, _ = env
+    await service.new_game("g", "t", "host", "")  # pitches
+    await service.pick("t", "host", 1)
+    await service.join("t", "host", "Sam", "")
+    await service.begin("t", "host")  # setup
+    await service.join("t", "late", "Lee", "")  # late-join character
+    await service.act("t", "host")
+    await service.act("t", "late")
+    await service.act("t", "u2")  # not a player; ignored
+    assert len(llm.temperatures) >= 3
+    assert set(llm.temperatures) == {0.7}
+
+
+async def test_temperature_can_be_left_to_the_provider():
+    db = await connect(":memory:")
+    llm = GMFake()
+    service = GameService(llm, GameStore(db), temperature=None, roll=lambda: Roll((4, 4)))
+    await service.new_game("g", "t", "host", "")
+    assert llm.temperatures == [None]
+    await db.close()
+
+
+async def test_prompts_ask_for_grounded_story(env):
+    service, store, llm, _ = env
+    await started_game(service)
+    system = llm.systems[-1]
+    assert "Grounded storytelling" in system
+    assert "Do not invent new" in system
+    assert "out of character" in system
+    setup_prompt = llm.calls[-1]
+    assert '"goal"' in setup_prompt and '"mysteries"' in setup_prompt
+
+    game = await store.game_for_thread("t")
+    assert game.outline["goal"].startswith("Find the AI's core")
+    assert game.outline["mysteries"][0]["answer"] == "The AI dreams."
+
+    await service.act("t", "host")
+    await service.act("t", "u2")
+    round_prompt = llm.calls[-1]
+    assert "Find the AI's core" in round_prompt  # the outline (with the goal) goes every round
+    assert "Reveal at least one" not in round_prompt  # act 1
+
+
+async def test_middle_acts_require_progress_each_round(env):
+    service, store, llm, _ = env
+    await started_game(service)
+    game = await store.game_for_thread("t")
+    await store.update_game(game.id, act=2, round_number=5)
+    await service.act("t", "host")
+    await service.act("t", "u2")
+    assert "Reveal at least one concrete answer" in llm.calls[-1]
+
+
+async def test_pitches_do_not_ask_for_strange_twists(env):
+    service, _, llm, _ = env
+    await service.new_game("g", "t", "host", "")
+    assert "strange twist" not in llm.calls[-1]
+    assert "wildcard" not in llm.calls[-1]

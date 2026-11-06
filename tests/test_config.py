@@ -26,6 +26,7 @@ def test_loads_from_environment_with_defaults(monkeypatch):
     assert s.database_path == Path("data/companion.db")
     assert s.github_lookups is True
     assert s.github_token is None
+    assert s.game_temperature == 0.7
 
 
 def test_github_token_is_optional_and_masked(monkeypatch):
@@ -54,7 +55,13 @@ def test_empty_model_is_rejected(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "name,value", [("LLM_TIMEOUT_SECONDS", "0"), ("RATE_LIMIT_PER_MINUTE", "0")]
+    "name,value",
+    [
+        ("LLM_TIMEOUT_SECONDS", "0"),
+        ("RATE_LIMIT_PER_MINUTE", "0"),
+        ("GAME_TEMPERATURE", "-0.1"),
+        ("GAME_TEMPERATURE", "2.5"),
+    ],
 )
 def test_invalid_numbers_are_rejected(monkeypatch, name, value):
     _set_env(monkeypatch, **{name: value})

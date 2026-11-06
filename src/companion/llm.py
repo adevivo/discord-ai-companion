@@ -58,7 +58,7 @@ class LLMClient:
     async def aclose(self) -> None:
         await self._client.close()
 
-    async def complete(self, messages: list[ChatMessage]) -> str:
+    async def complete(self, messages: list[ChatMessage], temperature: float | None = None) -> str:
         if not messages:
             raise ValueError("messages must not be empty")
 
@@ -68,6 +68,8 @@ class LLMClient:
         }
         if self._max_tokens is not None:
             params["max_tokens"] = self._max_tokens
+        if temperature is not None:
+            params["temperature"] = temperature
 
         try:
             response = await self._client.chat.completions.create(**params)

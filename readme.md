@@ -108,6 +108,7 @@ cp .env.example .env
 | `GLOBAL_RATE_LIMIT_PER_MINUTE` | | `20` | Limit across all users, to protect the provider account's quota |
 | `GAME_ROUND_HOURS` | | `24` | Round deadline in Game Master mode (reminder at the halfway point) |
 | `GAME_TARGET_ROUNDS` | | `12` | Target adventure length in rounds (hard stop 2 rounds later) |
+| `GAME_TEMPERATURE` | | `0.7` | Sampling temperature for Game Master calls (lower = more coherent, less wild) |
 | `DATABASE_PATH` | | `data/companion.db` (`/data/companion.db` in Docker) | SQLite file location |
 
 Secrets are typed as `SecretStr`, so they're masked in logs and error output. If required values are missing, startup fails fast and names the missing variables, never their values.
@@ -234,7 +235,7 @@ Games are **asynchronous**, played over days in a dedicated thread.
 1. **`/game new genre:<text>`** in any regular channel. The bot opens a thread for the game, and the person who ran it is the **host**. The genre is free text, e.g. "cyberpunk heist" or "modern day, but the town's clocks run backwards". Leave it blank and the GM pitches three premises; the host chooses with **`/game pick`**.
 2. **`/game join concept:<optional hint>`** in the thread. The GM creates each character, using the player's hint if given ("burned-out ex-cop who owes a fixer money"). **Late joiners** are welcome: their character is created on the spot and written into the story.
 3. **`/game begin`** (host only). The GM writes a hidden outline, posts character cards, and opens round 1.
-4. **Each round**, players post freely **in character** in the thread over the day. Messages starting with `((` or `//` are out-of-character and ignored. When a player is done, they use **`/act`** (optionally with a final note).
+4. **Each round**, players post freely **in character** in the thread over the day. Messages starting with `ooc`, `((` or `//` are out-of-character and ignored (the GM is also told to ignore obvious real-life chat). When a player is done, they use **`/act`** (optionally with a final note).
 5. The round **resolves** when every player has acted or the **24-hour deadline** passes. Players who didn't act follow the group's lead. At the halfway point, the bot pings only the players who haven't acted yet.
 6. The adventure targets **about 12 rounds**. The GM steers toward an ending, posts an epilogue, and the game closes.
 
